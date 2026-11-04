@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+@theme {
+  --color-app: #0d0d0f;
+  --color-panel: #161618;
+  --color-raised: #202024;
+  --color-line: #2a2a2f;
+  --color-ink: #f4f4f5;
+  --color-mute: #8d8d96;
+  --color-accent: #f12c4c;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--color-app);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    user-select: none;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button {
+    cursor: pointer;
+  }
+}
+
+/* Slim, unobtrusive scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2f2f35;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #44444c;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Flat slider with filled track (fill is set inline via background gradient) */
+input[type="range"].param-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  touch-action: none;
+}
+
+input[type="range"].param-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+input[type="range"].param-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
