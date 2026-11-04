@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e11d48"/>
+      <stop offset="0.55" stop-color="#f12c4c"/>
+      <stop offset="1" stop-color="#ff6b3d"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#ffe4dc"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="44" height="44" rx="13" fill="url(#bg)"/>
+  <ellipse cx="24" cy="24" rx="17" ry="6.5" transform="rotate(-24 24 24)" stroke="#fff" stroke-opacity="0.35" stroke-width="1.2"/>
+  <g fill="url(#bar)">
+    <rect x="11" y="20" width="4" height="8" rx="2"/>
+    <rect x="17.5" y="14" width="4" height="20" rx="2"/>
+    <rect x="24" y="9" width="4" height="30" rx="2"/>
+    <rect x="30.5" y="15" width="4" height="18" rx="2"/>
+    <rect x="37" y="21" width="4" height="6" rx="2"/>
+  </g>
+  <circle cx="38.5" cy="10.5" r="2" fill="#fff"/>
+</svg>

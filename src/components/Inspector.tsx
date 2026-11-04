@@ -4,6 +4,7 @@ import {
   ArrowLeftRight,
   ChevronDown,
   Copy,
+  Loader2,
   Maximize2,
   RotateCcw,
   Scissors,
@@ -27,7 +28,6 @@ import {
   ClipProcessSettings,
   DEFAULT_CLIP_PROCESSES,
   HarmonyMode,
-  MeterLevels,
   TrackEffects,
   WaveformSelection,
 } from '../types/audio';
@@ -35,6 +35,7 @@ import { audioEngine } from '../audio/audioEngine';
 import { applyPresetValues, MUSIC_PRESETS, VOCAL_SCALES, VOICE_PRESETS } from '../audio/presets';
 import { drawBufferWaveform } from '../utils/waveformDraw';
 import { ParamSlider, RangeInput } from './ParamSlider';
+import { TrackLevelBar } from './Arrangement';
 
 export type InspectorTab = 'edit' | 'fx' | 'mixer';
 
@@ -167,6 +168,10 @@ interface EditPanelProps {
   onSelectionChange: (sel: WaveformSelection | null) => void;
   onUpdateClip: (clipId: string, patch: Partial<AudioClip>) => void;
   onUpdateClipProcesses: (patch: Partial<ClipProcessSettings>) => void;
+  /** Duration-preserving transpose, rendered off-thread when the slider is released */
+  onCommitClipPitch: (semitones: number) => void;
+  /** True while the selected clip is being re-rendered in the background */
+  isRenderingClip: boolean;
   onSplit: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
@@ -180,6 +185,8 @@ const EditPanel: React.FC<EditPanelProps> = ({
   onSelectionChange,
   onUpdateClip,
   onUpdateClipProcesses,
+  onCommitClipPitch,
+  isRenderingClip,
   onSplit,
   onDuplicate,
   onDelete,
@@ -405,7 +412,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
           step={1}
           defaultValue={0}
           format={(v) => `${v > 0 ? '+' : ''}${v} st`}
-          onChange={(v) => patch({ pitchSemitones: v })}
+          onCommit={onCommitClipPitch}
         />
         <ParamSlider
           label="Speed"
@@ -581,8 +588,14 @@ const EditPanel: React.FC<EditPanelProps> = ({
 
         {/* Fine-Tune Process Sliders */}
         <div className="pt-2 border-t border-line">
-          <div className="text-[11px] font-semibold text-mute uppercase tracking-wider mb-1">
-            Fine-tune process intensity
+          <div className="text-[11px] font-semibold text-mute uppercase tracking-wider mb-1 flex items-center justify-between">
+            <span>Fine-tune process intensity</span>
+            {isRenderingClip && (
+              <span className="flex items-center gap-1 normal-case tracking-normal text-accent">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Rendering…
+              </span>
+            )}
           </div>
           <ParamSlider
             label="Auto-Pitch tune"
@@ -592,7 +605,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ autoPitch: v })}
+            onCommit={(v) => onUpdateClipProcesses({ autoPitch: v })}
           />
           <ParamSlider
             label="3-Part harmony"
@@ -602,7 +615,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ harmony: v })}
+            onCommit={(v) => onUpdateClipProcesses({ harmony: v })}
           />
           <ParamSlider
             label="Voice soften"
@@ -612,7 +625,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ voiceSoften: v })}
+            onCommit={(v) => onUpdateClipProcesses({ voiceSoften: v })}
           />
           <ParamSlider
             label="Noise removal"
@@ -622,7 +635,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ denoise: v })}
+            onCommit={(v) => onUpdateClipProcesses({ denoise: v })}
           />
           <ParamSlider
             label="Normalize peak"
@@ -632,7 +645,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ normalize: v })}
+            onCommit={(v) => onUpdateClipProcesses({ normalize: v })}
           />
           <ParamSlider
             label="Gain boost / cut"
@@ -642,7 +655,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={0.5}
             defaultValue={0}
             format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`}
-            onChange={(v) => onUpdateClipProcesses({ boostDb: v })}
+            onCommit={(v) => onUpdateClipProcesses({ boostDb: v })}
           />
           <ParamSlider
             label="Envelope fade in"
@@ -652,7 +665,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ fadeInShape: v })}
+            onCommit={(v) => onUpdateClipProcesses({ fadeInShape: v })}
           />
           <ParamSlider
             label="Envelope fade out"
@@ -662,7 +675,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             step={1}
             defaultValue={0}
             format={(v) => `${Math.round(v)}%`}
-            onChange={(v) => onUpdateClipProcesses({ fadeOutShape: v })}
+            onCommit={(v) => onUpdateClipProcesses({ fadeOutShape: v })}
           />
         </div>
       </Section>
@@ -1075,19 +1088,20 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
 interface MixerPanelProps {
   tracks: AudioTrack[];
   selectedTrack?: AudioTrack;
-  meterLevels: MeterLevels;
   masterVolume: number;
   onMasterVolume: (v: number) => void;
   onUpdateTrack: (trackId: string, patch: Partial<AudioTrack>) => void;
+  /** Extra master-bus panels (mastering, recording sync) rendered under the master fader. */
+  masterSection?: React.ReactNode;
 }
 
 const MixerPanel: React.FC<MixerPanelProps> = ({
   tracks,
   selectedTrack,
-  meterLevels,
   masterVolume,
   onMasterVolume,
   onUpdateTrack,
+  masterSection,
 }) => {
   const volText = (v: number) => (v <= 0.001 ? '-∞' : `${(20 * Math.log10(v)).toFixed(1)} dB`);
   return (
@@ -1108,8 +1122,9 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
         />
       </div>
 
+      {masterSection}
+
       {tracks.map((track) => {
-        const level = meterLevels.trackLevels[track.id] || 0;
         return (
           <div
             key={track.id}
@@ -1150,10 +1165,7 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
             </div>
 
             <div className="h-1 rounded-full bg-app overflow-hidden mb-3">
-              <div
-                className="h-full transition-[width] duration-75"
-                style={{ width: `${Math.min(100, level * 100)}%`, backgroundColor: track.color }}
-              />
+              <TrackLevelBar trackId={track.id} color={track.color} />
             </div>
 
             <ParamSlider

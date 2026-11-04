@@ -110,8 +110,13 @@ export interface AudioClip {
   fadeIn: number;
   /** Fade out duration in seconds */
   fadeOut: number;
-  /** Pitch shift in semitones (-12 to +12) */
+  /** Pitch shift in semitones (-12 to +12), duration-preserving */
   pitchSemitones: number;
+  /**
+   * Semitones already rendered into `bufferId`. Older projects lack this and played pitch via
+   * playback-rate detune; any difference from `pitchSemitones` is still applied that way.
+   */
+  renderedPitch?: number;
   /** Playback rate multiplier (0.5 to 2.0) */
   playbackRate: number;
   /** Accent color hex */
@@ -155,4 +160,35 @@ export interface MeterLevels {
   masterRmsDb: number;     // dBFS (LUFS approx)
   phaseCorrelation: number;// -1 to +1
   trackLevels: Record<string, number>;
+}
+
+export type MasterPresetId = 'off' | 'streaming' | 'loud' | 'warm' | 'voice' | 'custom';
+
+/** Master bus / mastering settings, saved per project. */
+export interface MasterSettings {
+  preset: MasterPresetId;
+  /** Glue compression amount (0 to 100 %) */
+  glue: number;
+  /** Low-shelf "warmth" at 120 Hz (-6 to +6 dB) */
+  lowDb: number;
+  /** High-shelf "air" at 10 kHz (-3 to +6 dB) */
+  airDb: number;
+  /** Stereo width (0 = mono, 1 = unchanged, 1.5 = wide) */
+  width: number;
+  /** Integrated loudness target for export (LUFS) */
+  targetLufs: number;
+  /** True-peak ceiling for export (dBTP) */
+  ceilingDb: number;
+}
+
+/** Result of measuring (and optionally mastering) a mixdown. */
+export interface LoudnessReport {
+  /** Loudness of the unmastered mix (LUFS) */
+  inputLufs: number;
+  /** Loudness after mastering (LUFS) */
+  outputLufs: number;
+  /** Estimated true peak after mastering (dBTP) */
+  truePeakDb: number;
+  /** Gain applied by loudness normalization (dB) */
+  gainDb: number;
 }

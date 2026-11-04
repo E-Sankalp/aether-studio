@@ -1,35 +1,28 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { audioEngine } from '../audio/audioEngine';
-import { MeterLevels } from '../types/audio';
+import { meterStore, useLiveStore } from '../utils/liveStore';
 
 type VizMode = 'spectrum' | 'scope';
 
 interface VisualizerDockProps {
   isPlaying: boolean;
-  onMeterUpdate?: (levels: MeterLevels) => void;
 }
 
 /** Compact live spectrum / scope + loudness read-out. Tap to switch view. */
-export const VisualizerDock: React.FC<VisualizerDockProps> = ({ isPlaying, onMeterUpdate }) => {
+export const VisualizerDock: React.FC<VisualizerDockProps> = ({ isPlaying }) => {
   const [mode, setMode] = useState<VizMode>('spectrum');
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [lufs, setLufs] = useState('-∞');
+  // Meter levels are fed app-wide (App.tsx); this only reads the short-term loudness
+  const lufs = useLiveStore(meterStore, (m) =>
+    m.masterRmsDb <= -59 ? '-∞' : (m.masterRmsDb - 0.7).toFixed(1)
+  );
 
   useEffect(() => {
     let animId = 0;
-    let lastEmit = 0;
     const freqData = new Uint8Array(1024);
     const timeData = new Uint8Array(1024);
 
-    const render = (now: number) => {
-      // Meters feed React state; throttle to ~20 fps to keep the UI light
-      if (now - lastEmit > 50) {
-        lastEmit = now;
-        const m = audioEngine.getMeterLevels();
-        setLufs(m.masterRmsDb <= -59 ? '-∞' : (m.masterRmsDb - 0.7).toFixed(1));
-        onMeterUpdate?.(m);
-      }
-
+    const render = () => {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (canvas && ctx) {
@@ -80,18 +73,19 @@ export const VisualizerDock: React.FC<VisualizerDockProps> = ({ isPlaying, onMet
 
     animId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animId);
-  }, [mode, isPlaying, onMeterUpdate]);
+  }, [mode, isPlaying]);
 
   return (
     <button
       onClick={() => setMode((m) => (m === 'spectrum' ? 'scope' : 'spectrum'))}
       title="Tap to switch spectrum / waveform view"
-      className="flex items-center gap-2 h-9 pl-2 pr-3 rounded-xl bg-raised border border-line"
+      aria-label="Output visualizer and loudness"
+      className="flex items-center gap-2.5 h-9 pl-2.5 pr-3 rounded-lg bg-black/25 border border-white/[0.06] hover:border-white/[0.12] transition-colors"
     >
-      <canvas ref={canvasRef} className="w-16 h-5 block" />
-      <span className="flex flex-col items-start leading-tight">
-        <span className="font-mono text-[11px] text-ink tabular-nums">{lufs}</span>
-        <span className="text-[9px] uppercase tracking-wider text-mute">LUFS</span>
+      <canvas ref={canvasRef} className="w-[72px] h-5 block" />
+      <span className="flex items-baseline gap-1 leading-none">
+        <span className="font-mono text-[12px] text-ink tabular-nums w-[34px] text-right">{lufs}</span>
+        <span className="text-[9px] font-semibold uppercase tracking-wider text-mute">LUFS</span>
       </span>
     </button>
   );

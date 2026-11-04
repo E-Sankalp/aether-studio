@@ -9,19 +9,20 @@ interface TimelineClipItemProps {
   isSelected: boolean;
   snapToGrid: boolean;
   bpm: number;
-  onSelect: (clipId: string) => void;
+  onSelectClip: (clipId: string, trackId: string) => void;
   onUpdateClip: (clipId: string, patch: Partial<AudioClip>, commitHistory?: boolean) => void;
 }
 
-export const TimelineClipItem: React.FC<TimelineClipItemProps> = ({
+const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
   clip,
   pixelsPerSecond,
   isSelected,
   snapToGrid,
   bpm,
-  onSelect,
+  onSelectClip,
   onUpdateClip,
 }) => {
+  const onSelect = (clipId: string) => onSelectClip(clipId, clip.trackId);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const buffer = audioEngine.getBuffer(clip.bufferId);
 
@@ -166,3 +167,6 @@ export const TimelineClipItem: React.FC<TimelineClipItemProps> = ({
     </div>
   );
 };
+
+/** Memoized: clips only re-render when their own props change. */
+export const TimelineClipItem = React.memo(TimelineClipItemImpl);

@@ -6,10 +6,16 @@ import {
   ClipProcessSettings,
   DEFAULT_CLIP_PROCESSES,
   LoopRegion,
-  MeterLevels,
+  LoudnessReport,
+  MasterSettings,
   TrackEffects,
   WaveformSelection,
 } from './types/audio';
+import { DEFAULT_MASTER } from './audio/mastering';
+import { MasteringPanel } from './components/MasteringPanel';
+import { LatencyPanel } from './components/LatencyPanel';
+import { MobileHeader, MobileTransport, StudioHeader, TransportProps } from './components/StudioHeader';
+import { meterStore, micLevelStore, playheadStore, useLiveStore } from './utils/liveStore';
 import { audioEngine } from './audio/audioEngine';
 import {
   DEFAULT_EFFECTS,
@@ -20,7 +26,8 @@ import {
   generateVocalStem,
 } from './audio/synthStems';
 import { buildTemplate, TemplateId, TRACK_COLORS } from './audio/projectTemplates';
-import { VisualizerDock } from './components/VisualizerDock';
+import { ExportMenu } from './components/ExportMenu';
+import { ExportFormatId, encodeAudioBuffer, getExportFormat } from './audio/audioEncoders';
 import { Arrangement } from './components/Arrangement';
 import { AddTrackMenu, STEM_LABELS, StemType } from './components/AddTrackMenu';
 import { Inspector, InspectorTabs, InspectorTab } from './components/Inspector';
@@ -32,6 +39,10 @@ import {
   exportProjectBundleFile,
   importProjectBundleFile,
   loadAllBuffersFromStorage,
+  initProjectLibrary,
+  subscribeStorageErrors,
+  pruneUnusedBuffers,
+  collectReferencedBufferIds,
   loadAllProjectsFromLibrary,
   loadProjectFromLocalStorage,
   PersistedProjectState,
@@ -39,30 +50,13 @@ import {
   saveProjectToLocalStorage,
 } from './utils/projectStorage';
 import {
-  Play,
-  Pause,
-  SkipBack,
-  Repeat,
-  Mic,
-  Download,
   Plus,
-  Undo2,
-  Redo2,
-  Magnet,
-  ZoomIn,
-  ZoomOut,
-  Music2,
   Layers,
   Waves,
   Sparkles,
   SlidersHorizontal,
   Disc3,
-  Scissors,
   Home as HomeIcon,
-  Headphones,
-  Timer,
-  Bell,
-  CheckCircle2,
 } from 'lucide-react';
 
 interface HistorySnapshot {
@@ -73,25 +67,6 @@ interface HistorySnapshot {
 type MobileTab = 'home' | 'tracks' | InspectorTab | 'studio';
 
 const MOBILE_BREAKPOINT = 900;
-
-const emptyMeters: MeterLevels = {
-  masterLeft: 0,
-  masterRight: 0,
-  masterPeakDb: -60,
-  masterRmsDb: -60,
-  phaseCorrelation: 1,
-  trackLevels: {},
-};
-
-const formatTimecode = (sec: number) => {
-  const mins = Math.floor(sec / 60);
-  const secs = Math.floor(sec % 60);
-  const cs = Math.floor((sec % 1) * 100);
-  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
-};
-
-const iconBtn =
-  'w-9 h-9 rounded-xl flex items-center justify-center text-ink bg-raised hover:bg-[#2b2b31] disabled:opacity-30 disabled:hover:bg-raised transition-colors';
 
 const TEMPLATE_TITLES: Record<TemplateId, string> = {
   scratch: 'Blank Project',
@@ -129,12 +104,18 @@ export const App: React.FC = () => {
     startTime: number;
     startedAtMs: number;
   } | null>(null);
-  const [micLevel, setMicLevel] = useState(0);
-  const [playhead, setPlayhead] = useState(0);
+  const setMicLevel = micLevelStore.set;
+  const setPlayhead = playheadStore.set;
+  // Coarse playhead (4 s steps) only to grow the timeline while playing past its end
+  const playheadCoarse = useLiveStore(playheadStore, (v) => Math.floor(v / 4) * 4);
   const [bpm, setBpm] = useState(120);
   const [snapToGrid, setSnapToGrid] = useState(true);
   const [pixelsPerSecond, setPixelsPerSecond] = useState(88);
   const [masterVolume, setMasterVolume] = useState(1.0);
+  const [master, setMaster] = useState<MasterSettings>(DEFAULT_MASTER);
+  const [loudnessReport, setLoudnessReport] = useState<LoudnessReport | null>(null);
+  const [reportStale, setReportStale] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [loop, setLoop] = useState<LoopRegion>({ enabled: false, start: 0, end: 8 });
   const [metronomeOn, setMetronomeOn] = useState(false);
@@ -143,9 +124,12 @@ export const App: React.FC = () => {
   const [micMonitorOn, setMicMonitorOn] = useState(false);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
+
+  // Surface storage problems (quota full / failed writes) instead of failing silently
+  useEffect(() => subscribeStorageErrors(setStorageWarning), []);
 
   const [selection, setSelection] = useState<WaveformSelection | null>(null);
-  const [meterLevels, setMeterLevels] = useState<MeterLevels>(emptyMeters);
 
   const [past, setPast] = useState<HistorySnapshot[]>([]);
   const [future, setFuture] = useState<HistorySnapshot[]>([]);
@@ -160,19 +144,32 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  const pushHistory = useCallback(
-    (nextTracks: AudioTrack[], nextClips: AudioClip[]) => {
-      setPast((prev) => [...prev.slice(-24), { tracks, clips }]);
-      setFuture([]);
-      setTracks(nextTracks);
-      setClips(nextClips);
-    },
-    [tracks, clips]
-  );
+  // Latest tracks/clips for async work (background renders finish after the closure is stale)
+  const liveRef = useRef({ tracks, clips });
+  liveRef.current = { tracks, clips };
+
+  const pushHistory = useCallback((nextTracks: AudioTrack[], nextClips: AudioClip[]) => {
+    const current = liveRef.current;
+    setPast((prev) => [...prev.slice(-24), { tracks: current.tracks, clips: current.clips }]);
+    setFuture([]);
+    liveRef.current = { tracks: nextTracks, clips: nextClips };
+    setTracks(nextTracks);
+    setClips(nextClips);
+  }, []);
+
+  /** Applies a project's mastering settings and drops the previous loudness analysis. */
+  const resetMastering = useCallback((next?: Partial<MasterSettings>) => {
+    const settings = { ...DEFAULT_MASTER, ...next };
+    setMaster(settings);
+    setLoudnessReport(null);
+    setReportStale(false);
+    audioEngine.setMasterSettings(settings, 0);
+  }, []);
 
   const loadTemplate = useCallback((templateId: TemplateId, clearAllStorage = false) => {
     audioEngine.stop();
     setIsPlaying(false);
+    resetMastering();
     if (clearAllStorage) {
       clearProjectLocalStorage();
       void clearStoredBuffers();
@@ -194,12 +191,35 @@ export const App: React.FC = () => {
     audioEngine.syncTracks(seed.tracks);
     setView('studio');
     setMobileTab('tracks');
-  }, []);
+  }, [resetMastering]);
+
+  /**
+   * Leaves the app with no project open (fresh install, last project deleted, all data cleared).
+   * Nothing is auto-created or auto-saved until the user starts or opens a project.
+   */
+  const closeSession = useCallback(() => {
+    audioEngine.stop();
+    setIsPlaying(false);
+    resetMastering();
+    setProjectId(`prj_${Date.now()}`);
+    setProjectName('Untitled Project');
+    setTracks([]);
+    setClips([]);
+    setSelectedTrackId('');
+    setSelectedClipId('');
+    setPlayhead(0);
+    setPast([]);
+    setFuture([]);
+    audioEngine.syncTracks([]);
+    setView('home');
+    setMobileTab('home');
+  }, [resetMastering, setPlayhead]);
 
   // Hydrate saved project + custom AudioBuffers from LocalStorage & IndexedDB on startup
   useEffect(() => {
     let cancelled = false;
     const initProject = async () => {
+      await initProjectLibrary();
       const pInfo = await requestPersistentStorage();
       if (!cancelled) setStorageInfo(pInfo);
 
@@ -227,11 +247,13 @@ export const App: React.FC = () => {
         setLoop(saved.loop || { enabled: false, start: 0, end: 8 });
         setMasterVolume(saved.masterVolume ?? 1.0);
         audioEngine.setMasterVolume(saved.masterVolume ?? 1.0);
+        resetMastering(saved.master);
         setSelectedTrackId(saved.selectedTrackId || saved.tracks[0].id);
         setSelectedClipId(saved.selectedClipId || validClips[0]?.id || '');
         audioEngine.syncTracks(saved.tracks);
       } else {
-        loadTemplate('demo');
+        // Nothing saved yet: start on Home with no project (the Demo Song is a template there)
+        closeSession();
       }
       setStorageHydrated(true);
     };
@@ -239,28 +261,31 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [loadTemplate]);
+  }, [closeSession, resetMastering]);
 
-  // Auto-save project state to LocalStorage library whenever tracks, clips, name, BPM, or loop change
+  // Auto-save (debounced) to the LocalStorage library whenever tracks, clips, name, BPM, or loop change
   useEffect(() => {
     if (!storageHydrated || tracks.length === 0) return;
-    saveProjectToLocalStorage({
-      id: projectId,
-      name: projectName,
-      tracks,
-      clips,
-      bpm,
-      loop,
-      masterVolume,
-      selectedTrackId,
-      selectedClipId,
-      updatedAt: Date.now(),
-    });
-    setSavedProjects(loadAllProjectsFromLibrary());
-    void requestPersistentStorage().then(setStorageInfo);
-    setSavedNotice(true);
-    const t = window.setTimeout(() => setSavedNotice(false), 1400);
-    return () => window.clearTimeout(t);
+    const saveTimer = window.setTimeout(() => {
+      saveProjectToLocalStorage({
+        id: projectId,
+        name: projectName,
+        tracks,
+        clips,
+        bpm,
+        loop,
+        masterVolume,
+        master,
+        selectedTrackId,
+        selectedClipId,
+        updatedAt: Date.now(),
+      });
+      setSavedProjects(loadAllProjectsFromLibrary());
+      void requestPersistentStorage().then(setStorageInfo);
+      setSavedNotice(true);
+      window.setTimeout(() => setSavedNotice(false), 1400);
+    }, 600);
+    return () => window.clearTimeout(saveTimer);
   }, [
     storageHydrated,
     projectId,
@@ -270,13 +295,55 @@ export const App: React.FC = () => {
     bpm,
     loop,
     masterVolume,
+    master,
     selectedTrackId,
     selectedClipId,
   ]);
 
+  // Feed master + per-track meters at ~20 fps for every meter in the UI
+  useEffect(() => {
+    let id = 0;
+    let last = 0;
+    const tick = (now: number) => {
+      if (now - last > 50) {
+        last = now;
+        meterStore.set(audioEngine.getMeterLevels());
+      }
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, []);
+
   useEffect(() => {
     audioEngine.setMetronome(metronomeOn, bpm);
   }, [metronomeOn, bpm]);
+
+  // Any change to the mix makes the last loudness analysis out of date
+  useEffect(() => {
+    setReportStale(true);
+  }, [tracks, clips, masterVolume, master]);
+
+  const handleMasterChange = useCallback((next: MasterSettings) => {
+    setMaster(next);
+    audioEngine.setMasterSettings(next);
+  }, []);
+
+  const handleAnalyzeLoudness = async () => {
+    setIsAnalyzing(true);
+    try {
+      const { report } = await audioEngine.renderMasteredMixdown(tracks, clips, masterVolume, master);
+      setLoudnessReport(report);
+      setReportStale(false);
+      // Match playback loudness to what the export will sound like
+      audioEngine.setMasterSettings(master, report.gainDb);
+    } catch (err) {
+      console.error('Loudness analysis failed:', err);
+      alert('Could not analyze the mix. Please try again.');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
 
   useEffect(() => {
     audioEngine.setMicMonitorEnabled(micMonitorOn, selectedTrackId);
@@ -293,7 +360,14 @@ export const App: React.FC = () => {
     }
   }, [clips, isPlaying, isRecording, tracks]);
 
-  // Playhead + mic level loop
+  // Loop region edits apply to running playback seamlessly (the engine schedules iterations)
+  useEffect(() => {
+    if (isPlaying && !isRecording) {
+      audioEngine.updateLoop(loop.enabled ? { start: loop.start, end: loop.end } : null);
+    }
+  }, [loop, isPlaying, isRecording]);
+
+  // Playhead + mic level loop (position comes from the audio clock)
   useEffect(() => {
     let rafId = 0;
     const maxClipEnd = clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
@@ -301,10 +375,9 @@ export const App: React.FC = () => {
     const tick = () => {
       if (isRecording && recordingSession) {
         setMicLevel(audioEngine.getMicInputLevel());
-        const elapsedSec = (performance.now() - recordingSession.startedAtMs) / 1000;
-        setPlayhead(recordingSession.startTime + elapsedSec);
+        setPlayhead(audioEngine.getTimelinePosition());
       } else if (isPlaying) {
-        const status = audioEngine.getCurrentPlayhead(loop, tracks, clips, totalEnd);
+        const status = audioEngine.getCurrentPlayhead(totalEnd);
         setPlayhead(status.time);
         if (status.ended) setIsPlaying(false);
       }
@@ -312,13 +385,21 @@ export const App: React.FC = () => {
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [isPlaying, isRecording, recordingSession, loop, tracks, clips]);
+  }, [isPlaying, isRecording, recordingSession, loop, clips]);
+
+  /** Loop region to hand to the engine when playback starts at `from`. */
+  const loopFor = useCallback(
+    (from: number) =>
+      loop.enabled && from < loop.end ? { start: loop.start, end: loop.end } : null,
+    [loop]
+  );
 
   const handlePlayPause = useCallback(() => {
     if (isPlaying) {
       audioEngine.stop();
       setIsPlaying(false);
     } else {
+      const playhead = playheadStore.get();
       const maxClipEnd = clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       const startFrom =
         maxClipEnd > 0 && playhead >= maxClipEnd - 0.05
@@ -327,34 +408,22 @@ export const App: React.FC = () => {
             : 0
           : playhead;
       setPlayhead(startFrom);
-      audioEngine.play(
-        tracks,
-        clips,
-        startFrom,
-        loop.enabled && startFrom < loop.end ? loop.end : undefined
-      );
+      audioEngine.play(tracks, clips, startFrom, loopFor(startFrom), { bpm });
       setIsPlaying(true);
     }
-  }, [isPlaying, loop, playhead, tracks, clips]);
+  }, [isPlaying, loop, loopFor, tracks, clips, bpm, setPlayhead]);
 
   const handleRewind = useCallback(() => {
     setPlayhead(0);
-    if (isPlaying) audioEngine.play(tracks, clips, 0, loop.enabled ? loop.end : undefined);
-  }, [isPlaying, tracks, clips, loop]);
+    if (isPlaying) audioEngine.play(tracks, clips, 0, loopFor(0), { bpm });
+  }, [isPlaying, tracks, clips, loopFor, bpm]);
 
   const handleSeek = useCallback(
     (time: number) => {
       setPlayhead(time);
-      if (isPlaying) {
-        audioEngine.play(
-          tracks,
-          clips,
-          time,
-          loop.enabled && time < loop.end ? loop.end : undefined
-        );
-      }
+      if (isPlaying) audioEngine.play(tracks, clips, time, loopFor(time), { bpm });
     },
-    [isPlaying, tracks, clips, loop]
+    [isPlaying, tracks, clips, loopFor, bpm]
   );
 
   const handleUpdateTrack = useCallback((trackId: string, patch: Partial<AudioTrack>) => {
@@ -375,6 +444,7 @@ export const App: React.FC = () => {
   const handleSplitSelectedClip = useCallback(() => {
     const clip = clips.find((c) => c.id === selectedClipId);
     if (!clip) return;
+    const playhead = playheadStore.get();
     if (playhead <= clip.startTime + 0.08 || playhead >= clip.startTime + clip.duration - 0.08)
       return;
 
@@ -391,7 +461,7 @@ export const App: React.FC = () => {
     };
     pushHistory(tracks, clips.map((c) => (c.id === clip.id ? leftClip : c)).concat(rightClip));
     setSelectedClipId(rightClip.id);
-  }, [clips, selectedClipId, playhead, tracks, pushHistory]);
+  }, [clips, selectedClipId, tracks, pushHistory]);
 
   const handleDuplicateSelectedClip = useCallback(() => {
     const clip = clips.find((c) => c.id === selectedClipId);
@@ -429,143 +499,210 @@ export const App: React.FC = () => {
     [tracks, clips, selectedTrackId, pushHistory]
   );
 
-  const handleUpdateClipProcesses = useCallback(
-    (patch: Partial<ClipProcessSettings>) => {
-      const clip = clips.find((c) => c.id === selectedClipId);
+  /*
+   * Background clip rendering. Each commit (slider release / button) bumps a per-clip sequence
+   * number; only the newest render for a clip is applied, so fast successive edits never land out
+   * of order. `pendingClipState` holds the latest *requested* settings so edits made while a render
+   * is still running build on each other instead of on the last finished render.
+   */
+  const renderSeqRef = useRef(new Map<string, number>());
+  const pendingClipStateRef = useRef(
+    new Map<
+      string,
+      { processes: ClipProcessSettings; pitchSemitones: number; sourceBufferId: string }
+    >()
+  );
+  const [renderingClipIds, setRenderingClipIds] = useState<ReadonlySet<string>>(new Set());
+  const setClipRendering = (clipId: string, on: boolean) =>
+    setRenderingClipIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(clipId);
+      else next.delete(clipId);
+      return next;
+    });
+
+  /** Invalidates in-flight renders (e.g. on undo/redo) so they can't overwrite restored state. */
+  const cancelPendingRenders = useCallback(() => {
+    renderSeqRef.current.forEach((seq, id) => renderSeqRef.current.set(id, seq + 1));
+    pendingClipStateRef.current.clear();
+    setRenderingClipIds(new Set());
+  }, []);
+
+  const commitClipRender = useCallback(
+    async (
+      clipId: string,
+      change: {
+        processes?: Partial<ClipProcessSettings>;
+        pitchSemitones?: number;
+        sourceBufferId?: string;
+      }
+    ) => {
+      const clip = liveRef.current.clips.find((c) => c.id === clipId);
       if (!clip) return;
-      const trackForClip = tracks.find((t) => t.id === clip.trackId);
-      const sourceBufferId = clip.sourceBufferId || clip.bufferId;
-      const nextProcesses: ClipProcessSettings = {
-        ...DEFAULT_CLIP_PROCESSES,
-        ...clip.processes,
-        ...patch,
+      const base = pendingClipStateRef.current.get(clipId) ?? {
+        processes: { ...DEFAULT_CLIP_PROCESSES, ...clip.processes },
+        pitchSemitones: clip.pitchSemitones,
+        sourceBufferId: clip.sourceBufferId || clip.bufferId,
       };
+      const next = {
+        processes: { ...base.processes, ...change.processes },
+        pitchSemitones: change.pitchSemitones ?? base.pitchSemitones,
+        sourceBufferId: change.sourceBufferId ?? base.sourceBufferId,
+      };
+      pendingClipStateRef.current.set(clipId, next);
+      const seq = (renderSeqRef.current.get(clipId) ?? 0) + 1;
+      renderSeqRef.current.set(clipId, seq);
+      setClipRendering(clipId, true);
 
       const hasSel =
-        selection &&
-        selection.clipId === clip.id &&
-        selection.endOffset - selection.startOffset > 0.03;
+        selection && selection.clipId === clip.id && selection.endOffset - selection.startOffset > 0.03;
       const selStart = hasSel ? selection.startOffset : 0;
       const selEnd = hasSel ? selection.endOffset : clip.duration;
+      const track = liveRef.current.tracks.find((t) => t.id === clip.trackId);
 
-      const newBufId = audioEngine.renderClipProcesses(
-        clip.id,
-        sourceBufferId,
-        clip.offset,
-        selStart * clip.playbackRate,
-        selEnd * clip.playbackRate,
-        nextProcesses,
-        trackForClip?.effects.autoPitchScale || 'C_major'
-      );
-
-      if (newBufId) {
+      try {
+        const newBufId = await audioEngine.renderClip({
+          clipId,
+          sourceBufferId: next.sourceBufferId,
+          regionStartSec: clip.offset + selStart * clip.playbackRate,
+          regionEndSec: clip.offset + selEnd * clip.playbackRate,
+          processes: next.processes,
+          scaleId: track?.effects.autoPitchScale || 'C_major',
+          pitchSemitones: next.pitchSemitones,
+        });
+        if (renderSeqRef.current.get(clipId) !== seq) return; // superseded by a newer edit
+        pendingClipStateRef.current.delete(clipId);
+        const latest = liveRef.current;
+        if (!newBufId || !latest.clips.some((c) => c.id === clipId)) return;
         pushHistory(
-          tracks,
-          clips.map((c) =>
-            c.id === clip.id
-              ? { ...c, sourceBufferId, processes: nextProcesses, bufferId: newBufId }
+          latest.tracks,
+          latest.clips.map((c) =>
+            c.id === clipId
+              ? {
+                  ...c,
+                  sourceBufferId: next.sourceBufferId,
+                  processes: next.processes,
+                  pitchSemitones: next.pitchSemitones,
+                  renderedPitch: next.pitchSemitones,
+                  bufferId: newBufId,
+                }
               : c
           )
         );
+      } catch (err) {
+        console.error('Clip render failed:', err);
+        if (renderSeqRef.current.get(clipId) === seq) {
+          pendingClipStateRef.current.delete(clipId);
+          setStorageWarning('Could not process this clip. Please try again.');
+        }
+      } finally {
+        if (renderSeqRef.current.get(clipId) === seq) setClipRendering(clipId, false);
       }
     },
-    [clips, selectedClipId, selection, tracks, pushHistory]
+    [selection, pushHistory]
+  );
+
+  const handleUpdateClipProcesses = useCallback(
+    (patch: Partial<ClipProcessSettings>) => {
+      if (selectedClipId) void commitClipRender(selectedClipId, { processes: patch });
+    },
+    [selectedClipId, commitClipRender]
+  );
+
+  const handleCommitClipPitch = useCallback(
+    (semitones: number) => {
+      if (selectedClipId) void commitClipRender(selectedClipId, { pitchSemitones: semitones });
+    },
+    [selectedClipId, commitClipRender]
   );
 
   const handleApplyBufferOp = useCallback(
     (op: BufferOperationType) => {
       const clip = clips.find((c) => c.id === selectedClipId);
       if (!clip) return;
-      const cur: ClipProcessSettings = { ...DEFAULT_CLIP_PROCESSES, ...clip.processes };
+      // Toggles build on the latest requested settings (a render may still be running)
+      const pending = pendingClipStateRef.current.get(clip.id);
+      const cur: ClipProcessSettings = pending?.processes ?? {
+        ...DEFAULT_CLIP_PROCESSES,
+        ...clip.processes,
+      };
 
-      if (op === 'autoPitch') {
-        handleUpdateClipProcesses({ autoPitch: cur.autoPitch > 0 ? 0 : 80 });
-        return;
-      }
-      if (op === 'harmony') {
-        handleUpdateClipProcesses({ harmony: cur.harmony > 0 ? 0 : 65 });
-        return;
-      }
-      if (op === 'voiceSoften') {
-        handleUpdateClipProcesses({ voiceSoften: cur.voiceSoften > 0 ? 0 : 70 });
-        return;
-      }
-      if (op === 'denoise') {
-        handleUpdateClipProcesses({ denoise: cur.denoise > 0 ? 0 : 65 });
-        return;
-      }
-      if (op === 'normalize') {
-        handleUpdateClipProcesses({ normalize: cur.normalize > 0 ? 0 : 100 });
-        return;
-      }
-      if (op === 'boost') {
-        handleUpdateClipProcesses({ boostDb: Math.min(12, cur.boostDb + 3) });
-        return;
-      }
-      if (op === 'attenuate') {
-        handleUpdateClipProcesses({ boostDb: Math.max(-12, cur.boostDb - 3) });
-        return;
-      }
-      if (op === 'fadeIn') {
-        handleUpdateClipProcesses({ fadeInShape: cur.fadeInShape > 0 ? 0 : 35 });
-        return;
-      }
-      if (op === 'fadeOut') {
-        handleUpdateClipProcesses({ fadeOutShape: cur.fadeOutShape > 0 ? 0 : 35 });
-        return;
-      }
-      if (op === 'reverse') {
-        handleUpdateClipProcesses({ reverse: !cur.reverse });
+      const toggles: Partial<Record<BufferOperationType, Partial<ClipProcessSettings>>> = {
+        autoPitch: { autoPitch: cur.autoPitch > 0 ? 0 : 80 },
+        harmony: { harmony: cur.harmony > 0 ? 0 : 65 },
+        voiceSoften: { voiceSoften: cur.voiceSoften > 0 ? 0 : 70 },
+        denoise: { denoise: cur.denoise > 0 ? 0 : 65 },
+        normalize: { normalize: cur.normalize > 0 ? 0 : 100 },
+        boost: { boostDb: Math.min(12, cur.boostDb + 3) },
+        attenuate: { boostDb: Math.max(-12, cur.boostDb - 3) },
+        fadeIn: { fadeInShape: cur.fadeInShape > 0 ? 0 : 35 },
+        fadeOut: { fadeOutShape: cur.fadeOutShape > 0 ? 0 : 35 },
+        reverse: { reverse: !cur.reverse },
+      };
+      const toggle = toggles[op];
+      if (toggle) {
+        handleUpdateClipProcesses(toggle);
         return;
       }
 
-      const trackForClip = tracks.find((t) => t.id === clip.trackId);
-      const hasSel =
-        selection &&
-        selection.clipId === clip.id &&
-        selection.endOffset - selection.startOffset > 0.03;
-      const selStart = hasSel ? selection.startOffset : 0;
-      const selEnd = hasSel ? selection.endOffset : clip.duration;
-
-      const newBufId = audioEngine.applyBufferOperation(
-        clip.bufferId,
-        clip.offset,
-        clip.duration,
-        selStart * clip.playbackRate,
-        selEnd * clip.playbackRate,
-        op,
-        trackForClip?.effects.autoPitchScale || 'C_major',
-        Math.max(50, trackForClip?.effects.autoPitchAmount || 85)
-      );
-      if (newBufId) {
-        pushHistory(
-          tracks,
-          clips.map((c) =>
-            c.id === clip.id ? { ...c, sourceBufferId: newBufId, bufferId: newBufId } : c
-          )
+      if (op === 'silence') {
+        // Destructive edit on the untouched source, then re-render pitch + processes on top
+        const hasSel =
+          selection &&
+          selection.clipId === clip.id &&
+          selection.endOffset - selection.startOffset > 0.03;
+        const selStart = hasSel ? selection.startOffset : 0;
+        const selEnd = hasSel ? selection.endOffset : clip.duration;
+        const source = pending?.sourceBufferId ?? clip.sourceBufferId ?? clip.bufferId;
+        const newSrc = audioEngine.silenceRegion(
+          source,
+          clip.offset + selStart * clip.playbackRate,
+          clip.offset + selEnd * clip.playbackRate
         );
+        if (newSrc) void commitClipRender(clip.id, { sourceBufferId: newSrc });
       }
     },
-    [clips, selectedClipId, selection, tracks, pushHistory, handleUpdateClipProcesses]
+    [clips, selectedClipId, selection, handleUpdateClipProcesses, commitClipRender]
   );
 
   const handleUndo = useCallback(() => {
     if (past.length === 0) return;
+    cancelPendingRenders();
     const previous = past[past.length - 1];
     setPast((prev) => prev.slice(0, -1));
     setFuture((prev) => [{ tracks, clips }, ...prev]);
     setTracks(previous.tracks);
     setClips(previous.clips);
-  }, [past, tracks, clips]);
+  }, [past, tracks, clips, cancelPendingRenders]);
 
   const handleRedo = useCallback(() => {
     if (future.length === 0) return;
+    cancelPendingRenders();
     const next = future[0];
     setFuture((prev) => prev.slice(1));
     setPast((prev) => [...prev, { tracks, clips }]);
     setTracks(next.tracks);
     setClips(next.clips);
-  }, [future, tracks, clips]);
+  }, [future, tracks, clips, cancelPendingRenders]);
+
+  /*
+   * Storage cleanup: delete stored audio no longer referenced by any saved project, the open
+   * project, the undo/redo history, or a just-created buffer whose clip isn't committed yet.
+   */
+  useEffect(() => {
+    if (!storageHydrated) return;
+    const timer = window.setTimeout(() => {
+      const referenced = collectReferencedBufferIds(loadAllProjectsFromLibrary(), [
+        ...clips,
+        ...past.flatMap((s) => s.clips),
+        ...future.flatMap((s) => s.clips),
+      ]);
+      audioEngine.getRecentBufferIds().forEach((id) => referenced.add(id));
+      pendingClipStateRef.current.forEach((p) => referenced.add(p.sourceBufferId));
+      void pruneUnusedBuffers(referenced);
+    }, 8000);
+    return () => window.clearTimeout(timer);
+  }, [storageHydrated, clips, past, future]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -760,12 +897,20 @@ export const App: React.FC = () => {
    *   input through the track's FX chain if Live Mic Monitoring is enabled.
    */
   const handleToggleRecording = async () => {
+    const playhead = playheadStore.get();
     if (countInBeat !== null) {
+      // Cancel during the count-in: discard the (not yet started) take
       if (countInTimerRef.current) {
         window.clearInterval(countInTimerRef.current);
         countInTimerRef.current = null;
       }
       setCountInBeat(null);
+      audioEngine.stop();
+      await audioEngine.cancelMicRecording();
+      setIsPlaying(false);
+      setIsRecording(false);
+      setRecordingSession(null);
+      setMicLevel(0);
       return;
     }
 
@@ -813,65 +958,73 @@ export const App: React.FC = () => {
       const safeStart = findNonOverlappingStart(target.id, playhead);
       setShowAddMenu(false);
 
-      const beginActualRecording = async () => {
-        try {
-          await audioEngine.startMicRecording(target.id);
-          setPlayhead(safeStart);
-          setRecordingSession({
-            trackId: target.id,
-            startTime: safeStart,
-            startedAtMs: performance.now(),
-          });
-          setIsRecording(true);
-
-          // Play backing tracks (excluding clips on the track being recorded if at the same time)
-          const backingClips = clips.filter(
-            (c) => c.trackId !== target.id || c.startTime + c.duration <= safeStart
-          );
-          audioEngine.play(tracks, backingClips, safeStart);
-          setIsPlaying(true);
-        } catch {
-          alert('Microphone access could not be started. Please check your browser permissions.');
-        }
-      };
-
-      if (countInEnabled) {
-        audioEngine.stop();
-        setIsPlaying(false);
-        const beatMs = (60 / Math.max(40, Math.min(240, bpm))) * 1000;
-        let beat = 1;
-        setCountInBeat(1);
-        audioEngine.playClickSound(true);
-        countInTimerRef.current = window.setInterval(() => {
-          beat += 1;
-          if (beat <= 4) {
-            setCountInBeat(beat);
-            audioEngine.playClickSound(false);
-          } else {
-            if (countInTimerRef.current) {
-              window.clearInterval(countInTimerRef.current);
-              countInTimerRef.current = null;
-            }
-            setCountInBeat(null);
-            void beginActualRecording();
-          }
-        }, beatMs);
-      } else {
-        await beginActualRecording();
+      // Open the mic first so its start-up delay never eats into the count-in or the downbeat
+      audioEngine.stop();
+      setIsPlaying(false);
+      try {
+        await audioEngine.startMicRecording(target.id);
+      } catch {
+        alert('Microphone access could not be started. Please check your browser permissions.');
+        return;
       }
+
+      setPlayhead(safeStart);
+      setRecordingSession({ trackId: target.id, startTime: safeStart, startedAtMs: performance.now() });
+      setIsRecording(true);
+
+      // Count-in clicks and the playback start are both scheduled on the audio clock, so the
+      // backing track starts exactly on the beat after "4"
+      let startAtCtx: number | undefined;
+      if (countInEnabled) {
+        const beatLen = 60 / Math.max(40, Math.min(240, bpm));
+        startAtCtx = audioEngine.scheduleCountIn(bpm, 4);
+        const firstBeat = startAtCtx - 4 * beatLen;
+        const ctx = audioEngine.getContext();
+        setCountInBeat(1);
+        countInTimerRef.current = window.setInterval(() => {
+          const beat = Math.floor((ctx.currentTime - firstBeat) / beatLen) + 1;
+          if (beat > 4) {
+            if (countInTimerRef.current) window.clearInterval(countInTimerRef.current);
+            countInTimerRef.current = null;
+            setCountInBeat(null);
+          } else {
+            setCountInBeat(Math.max(1, beat));
+          }
+        }, 30);
+      }
+
+      // Play backing tracks (excluding clips on the track being recorded if at the same time)
+      const backingClips = clips.filter(
+        (c) => c.trackId !== target.id || c.startTime + c.duration <= safeStart
+      );
+      audioEngine.play(tracks, backingClips, safeStart, null, { bpm, startAtCtx });
+      setIsPlaying(true);
     }
   };
 
-  const handleExportWav = async () => {
+  const handleExport = async (formatId: ExportFormatId) => {
     setIsExporting(true);
     try {
-      const blob = await audioEngine.exportMixdownWav(tracks, clips, masterVolume);
+      const format = getExportFormat(formatId);
+      const { buffer: rendered, report } = await audioEngine.renderMasteredMixdown(
+        tracks,
+        clips,
+        masterVolume,
+        master
+      );
+      setLoudnessReport(report);
+      setReportStale(false);
+      audioEngine.setMasterSettings(master, report.gainDb);
+      const blob = await encodeAudioBuffer(rendered, formatId);
+      const safeName = (projectName || 'AETHER_Mixdown').replace(/[^a-zA-Z0-9_-]+/g, '_');
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `AETHER_Mixdown_${bpm}BPM.wav`;
+      a.download = `${safeName}_${bpm}BPM.${format.extension}`;
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
     } catch (err) {
       console.error('Export failed:', err);
       alert('Export failed. Please try again.');
@@ -890,8 +1043,13 @@ export const App: React.FC = () => {
   const durationSec = Math.max(
     18,
     clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 12) + 6,
-    playhead + 4
+    playheadCoarse + 8
   );
+
+  const handleSelectClip = useCallback((clipId: string, trackId: string) => {
+    setSelectedClipId(clipId);
+    setSelectedTrackId(trackId);
+  }, []);
 
   const inspectorProps = {
     selectedTrack,
@@ -903,13 +1061,27 @@ export const App: React.FC = () => {
     onUpdateTrackEffects: handleUpdateTrackEffects,
     onUpdateClip: handleUpdateClip,
     onUpdateClipProcesses: handleUpdateClipProcesses,
+    onCommitClipPitch: handleCommitClipPitch,
+    isRenderingClip: Boolean(selectedClip && renderingClipIds.has(selectedClip.id)),
     onSplit: handleSplitSelectedClip,
     onDuplicate: handleDuplicateSelectedClip,
     onDelete: handleDeleteSelectedClip,
     onApplyBufferOp: handleApplyBufferOp,
-    meterLevels,
     masterVolume,
     onMasterVolume: handleMasterVolume,
+    masterSection: (
+      <>
+        <MasteringPanel
+          settings={master}
+          onChange={handleMasterChange}
+          report={loudnessReport}
+          reportStale={reportStale}
+          analyzing={isAnalyzing}
+          onAnalyze={handleAnalyzeLoudness}
+        />
+        <LatencyPanel disabled={isRecording || countInBeat !== null} />
+      </>
+    ),
   };
 
   const arrangementProps = {
@@ -917,21 +1089,16 @@ export const App: React.FC = () => {
     clips,
     selectedTrackId: selectedTrack?.id ?? '',
     selectedClipId,
-    playhead,
     loop,
     bpm,
     pixelsPerSecond,
     durationSec,
     snapToGrid,
-    trackLevels: meterLevels.trackLevels,
     recording: recordingSession
       ? { trackId: recordingSession.trackId, startTime: recordingSession.startTime }
       : null,
     onSelectTrack: setSelectedTrackId,
-    onSelectClip: (clipId: string, trackId: string) => {
-      setSelectedClipId(clipId);
-      setSelectedTrackId(trackId);
-    },
+    onSelectClip: handleSelectClip,
     onUpdateTrack: handleUpdateTrack,
     onUpdateClip: handleUpdateClip,
     onDeleteTrack: handleDeleteTrack,
@@ -947,108 +1114,6 @@ export const App: React.FC = () => {
     />
   );
 
-  const logo = (
-    <div className="flex items-center gap-2.5">
-      <div className="w-8 h-8 rounded-xl bg-accent flex items-center justify-center">
-        <Music2 className="w-4 h-4 text-white" />
-      </div>
-      <span className="text-[15px] font-bold tracking-tight">Aether</span>
-    </div>
-  );
-
-  const playButton = (size: string) => (
-    <button
-      onClick={handlePlayPause}
-      title="Play / Pause (Space)"
-      className={`${size} rounded-full bg-accent text-white flex items-center justify-center hover:brightness-110 transition`}
-    >
-      {isPlaying && !isRecording ? (
-        <Pause className="w-4 h-4 fill-current" />
-      ) : (
-        <Play className="w-4 h-4 fill-current ml-0.5" />
-      )}
-    </button>
-  );
-
-  const recordButton = (
-    <button
-      onClick={handleToggleRecording}
-      title={`Record into "${selectedTrack?.name || 'selected track'}"`}
-      className={`h-9 rounded-xl flex items-center justify-center gap-1.5 px-3 text-xs font-semibold transition-colors ${
-        countInBeat !== null
-          ? 'bg-amber-500 text-black animate-pulse'
-          : isRecording
-          ? 'bg-accent text-white animate-pulse'
-          : 'bg-raised text-ink hover:bg-[#2b2b31]'
-      }`}
-    >
-      <Mic
-        className={`w-4 h-4 ${
-          countInBeat !== null ? 'text-black' : isRecording ? 'text-white' : 'text-accent'
-        }`}
-      />
-      {countInBeat !== null ? (
-        <span className="font-mono font-bold tabular-nums">Count-in {countInBeat}/4</span>
-      ) : isRecording ? (
-        <span className="font-mono tabular-nums">Stop · {Math.round(micLevel * 100)}%</span>
-      ) : (
-        <span className="hidden sm:inline truncate max-w-[110px]">
-          Rec · {selectedTrack?.name || 'Track'}
-        </span>
-      )}
-    </button>
-  );
-
-  const loopButton = (
-    <button
-      onClick={() => setLoop((l) => ({ ...l, enabled: !l.enabled }))}
-      title="Loop"
-      className={`${iconBtn} ${loop.enabled ? '!bg-accent/20 !text-accent' : ''}`}
-    >
-      <Repeat className="w-4 h-4" />
-    </button>
-  );
-
-  const metronomeButton = (
-    <button
-      onClick={() => setMetronomeOn((m) => !m)}
-      title="Metronome click track"
-      className={`${iconBtn} ${metronomeOn ? '!bg-accent/20 !text-accent' : ''}`}
-    >
-      <Bell className="w-4 h-4" />
-    </button>
-  );
-
-  const countInButton = (
-    <button
-      onClick={() => setCountInEnabled((c) => !c)}
-      title="4-beat count-in (1 - 2 - 3 - 4) before recording"
-      className={`h-9 px-2.5 rounded-xl flex items-center gap-1 text-xs font-semibold transition-colors ${
-        countInEnabled
-          ? 'bg-accent/20 text-accent'
-          : 'bg-raised text-mute hover:text-ink'
-      }`}
-    >
-      <Timer className="w-3.5 h-3.5" />
-      <span>4B</span>
-    </button>
-  );
-
-  const monitorButton = (
-    <button
-      onClick={() => setMicMonitorOn((m) => !m)}
-      title="Live Mic Monitoring with track effects (use headphones)"
-      className={`h-9 px-2.5 rounded-xl flex items-center gap-1 text-xs font-semibold transition-colors ${
-        micMonitorOn
-          ? 'bg-emerald-500/20 text-emerald-400'
-          : 'bg-raised text-mute hover:text-ink'
-      }`}
-    >
-      <Headphones className="w-3.5 h-3.5" />
-      <span className="hidden xl:inline">Mon</span>
-    </button>
-  );
-
   const handleManualSave = () => {
     saveProjectToLocalStorage({
       id: projectId,
@@ -1058,6 +1123,7 @@ export const App: React.FC = () => {
       bpm,
       loop,
       masterVolume,
+      master,
       selectedTrackId,
       selectedClipId,
       updatedAt: Date.now(),
@@ -1080,6 +1146,7 @@ export const App: React.FC = () => {
     setLoop(proj.loop || { enabled: false, start: 0, end: 8 });
     setMasterVolume(proj.masterVolume ?? 1.0);
     audioEngine.setMasterVolume(proj.masterVolume ?? 1.0);
+    resetMastering(proj.master);
     setSelectedTrackId(proj.selectedTrackId || proj.tracks[0]?.id || '');
     setSelectedClipId(proj.selectedClipId || validClips[0]?.id || '');
     setPast([]);
@@ -1087,21 +1154,33 @@ export const App: React.FC = () => {
     audioEngine.syncTracks(proj.tracks);
     setView('studio');
     setMobileTab('tracks');
-  }, []);
+  }, [resetMastering]);
 
   const handleDeleteSavedProject = useCallback(
     (targetId: string) => {
+      const target = savedProjects.find((p) => p.id === targetId);
+      if (
+        !window.confirm(
+          `Delete "${target?.name || 'this project'}" from this device? This cannot be undone.`
+        )
+      ) {
+        return;
+      }
       const remaining = deleteProjectFromLibrary(targetId);
       setSavedProjects(remaining);
+      // Free recorded audio that no remaining project (or the open project) still uses
+      void pruneUnusedBuffers(
+        collectReferencedBufferIds(remaining, targetId === projectId ? [] : clips)
+      );
       if (targetId === projectId) {
         if (remaining.length > 0) {
           handleOpenSavedProject(remaining[0]);
         } else {
-          loadTemplate('scratch', false);
+          closeSession();
         }
       }
     },
-    [projectId, handleOpenSavedProject, loadTemplate]
+    [projectId, clips, savedProjects, handleOpenSavedProject, closeSession]
   );
 
   const handleClearAllSavedData = useCallback(() => {
@@ -1115,8 +1194,8 @@ export const App: React.FC = () => {
     clearProjectLocalStorage();
     void clearStoredBuffers();
     setSavedProjects([]);
-    loadTemplate('scratch', true);
-  }, [loadTemplate]);
+    closeSession();
+  }, [closeSession]);
 
   const handleExportProjectFile = useCallback((proj: PersistedProjectState) => {
     exportProjectBundleFile(proj, (bufId) => audioEngine.getBuffer(bufId));
@@ -1154,20 +1233,90 @@ export const App: React.FC = () => {
     onClearAllData: handleClearAllSavedData,
   };
 
-  const saveBadgeButton = (
-    <button
-      onClick={handleManualSave}
-      title="Project and recorded audio are saved permanently on this device (tap to save now)"
-      className={`h-8 px-2.5 rounded-lg flex items-center gap-1 text-[11px] font-semibold transition-colors ${
-        savedNotice
-          ? 'bg-emerald-500/20 text-emerald-400'
-          : 'bg-raised text-mute hover:text-ink'
-      }`}
+  const storageBanner = storageWarning ? (
+    <div
+      role="alert"
+      className="fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-[100] max-w-[92vw] w-[460px] flex items-start gap-3 px-4 py-3 rounded-2xl border border-amber-400/40 bg-[#2a2210]/95 text-amber-100 text-xs shadow-2xl backdrop-blur"
     >
-      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-      <span>Saved</span>
-    </button>
+      <span className="flex-1 leading-relaxed">{storageWarning}</span>
+      <button
+        onClick={() => setStorageWarning(null)}
+        className="shrink-0 font-semibold text-amber-300 hover:text-white"
+      >
+        Dismiss
+      </button>
+    </div>
+  ) : null;
+
+  const transportProps: TransportProps = {
+    isPlaying,
+    isRecording,
+    countInBeat,
+    recordTargetName: selectedTrack?.name || 'selected track',
+    onPlayPause: handlePlayPause,
+    onRewind: handleRewind,
+    onRecord: handleToggleRecording,
+    loopOn: loop.enabled,
+    onToggleLoop: () => setLoop((l) => ({ ...l, enabled: !l.enabled })),
+    metronomeOn,
+    onToggleMetronome: () => setMetronomeOn((m) => !m),
+    countInOn: countInEnabled,
+    onToggleCountIn: () => setCountInEnabled((c) => !c),
+    monitorOn: micMonitorOn,
+    onToggleMonitor: () => setMicMonitorOn((m) => !m),
+  };
+
+  const hasSession = tracks.length > 0;
+
+  // Shown only after storage has loaded, so a saved project never flashes "No project open"
+  const noProjectState = !storageHydrated ? (
+    <div className="flex-1" />
+  ) : (
+    <div className="flex-1 min-h-0 flex items-center justify-center p-6">
+      <div className="max-w-sm text-center">
+        <div className="mx-auto w-12 h-12 rounded-2xl bg-raised border border-line flex items-center justify-center mb-4">
+          <Layers className="w-5 h-5 text-mute" />
+        </div>
+        <h2 className="text-[15px] font-semibold">No project open</h2>
+        <p className="text-[13px] text-mute mt-1.5 leading-relaxed">
+          Start a blank project, or pick a template or saved project on Home.
+        </p>
+        <div className="flex flex-wrap justify-center gap-2 mt-5">
+          <button
+            onClick={() => loadTemplate('scratch', false)}
+            className="h-9 px-4 rounded-lg brand-gradient text-white text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-accent/25 hover:brightness-110"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            New blank project
+          </button>
+          <button
+            onClick={() => {
+              setView('home');
+              setMobileTab('home');
+            }}
+            className="h-9 px-4 rounded-lg bg-raised border border-line hover:border-accent/50 text-xs font-semibold text-ink flex items-center gap-1.5"
+          >
+            <HomeIcon className="w-3.5 h-3.5" />
+            Go to Home
+          </button>
+        </div>
+      </div>
+    </div>
   );
+
+  const projectChromeProps = {
+    // A session exists once a project with at least one track is loaded
+    hasSession,
+    projectName,
+    onProjectNameChange: setProjectName,
+    savedFlash: savedNotice,
+    onSave: handleManualSave,
+    onNewProject: () => loadTemplate('scratch', false),
+    canUndo: past.length > 0,
+    canRedo: future.length > 0,
+    onUndo: handleUndo,
+    onRedo: handleRedo,
+  };
 
   /* ------------------------------ mobile layout ----------------------------- */
   if (isMobile) {
@@ -1182,6 +1331,7 @@ export const App: React.FC = () => {
 
     return (
       <div className="h-[100dvh] flex flex-col bg-app text-ink overflow-hidden">
+        {storageBanner}
         <input
           ref={fileInputRef}
           type="file"
@@ -1198,38 +1348,18 @@ export const App: React.FC = () => {
           onChange={(e) => handleImportProjectFileChange(e.target.files)}
         />
 
-        <header className="h-14 px-3 flex items-center justify-between shrink-0 border-b border-line bg-panel">
-          <div className="flex items-center gap-2 min-w-0">
-            {logo}
-            <input
-              value={projectName}
-              onChange={(e) => setProjectName(e.target.value)}
-              title="Project name (auto-saved)"
-              className="w-24 sm:w-36 h-7 px-2 rounded-lg bg-app border border-line text-xs font-medium text-ink outline-none focus:border-accent truncate"
-            />
-          </div>
-          <div className="flex items-center gap-1.5 shrink-0">
-            {saveBadgeButton}
-            <button
-              onClick={() => loadTemplate('scratch', false)}
-              className="h-8 px-2.5 rounded-lg bg-raised text-xs font-medium text-ink"
-            >
-              New
-            </button>
-            <VisualizerDock isPlaying={isPlaying} onMeterUpdate={setMeterLevels} />
-            <button onClick={handleUndo} disabled={past.length === 0} className={iconBtn}>
-              <Undo2 className="w-4 h-4" />
-            </button>
-            <button onClick={handleRedo} disabled={future.length === 0} className={iconBtn}>
-              <Redo2 className="w-4 h-4" />
-            </button>
-          </div>
-        </header>
+        <MobileHeader
+          {...projectChromeProps}
+          onHome={mobileTab === 'home' || !hasSession}
+          onContinue={() => setMobileTab('tracks')}
+        />
 
         <div className="flex-1 min-h-0 flex flex-col">
           {mobileTab === 'home' && <Home {...homeProps} />}
 
-          {mobileTab === 'tracks' && (
+          {!hasSession && mobileTab !== 'home' && mobileTab !== 'studio' && noProjectState}
+
+          {hasSession && mobileTab === 'tracks' && (
             <Arrangement
               {...arrangementProps}
               pixelsPerSecond={Math.min(pixelsPerSecond, 70)}
@@ -1250,7 +1380,7 @@ export const App: React.FC = () => {
             />
           )}
 
-          {(mobileTab === 'edit' || mobileTab === 'fx' || mobileTab === 'mixer') && (
+          {hasSession && (mobileTab === 'edit' || mobileTab === 'fx' || mobileTab === 'mixer') && (
             <>
               {selectedTrack && (
                 <div className="h-[112px] shrink-0 flex flex-col border-b border-line">
@@ -1279,44 +1409,12 @@ export const App: React.FC = () => {
                 <h2 className="text-[13px] font-semibold px-1 pb-2">Add a track</h2>
                 {addTrackMenu}
               </div>
-              <button
-                onClick={handleExportWav}
-                disabled={isExporting}
-                className="h-12 rounded-2xl bg-accent text-white text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                <Download className="w-4 h-4" />
-                {isExporting ? 'Rendering…' : 'Export WAV'}
-              </button>
+              <ExportMenu isExporting={isExporting} onExport={handleExport} inline />
             </div>
           )}
         </div>
 
-        {/* Transport */}
-        {mobileTab !== 'home' && (
-          <div className="h-16 px-3 shrink-0 flex items-center justify-between border-t border-line bg-panel">
-            <div className="flex items-center gap-1.5">
-              <button onClick={handleRewind} className={iconBtn}>
-                <SkipBack className="w-4 h-4" />
-              </button>
-              {playButton('w-10 h-10')}
-              {recordButton}
-            </div>
-            <div className="font-mono text-xs tabular-nums">{formatTimecode(playhead)}</div>
-            <div className="flex items-center gap-1.5">
-              {metronomeButton}
-              {countInButton}
-              {monitorButton}
-              <button
-                onClick={handleSplitSelectedClip}
-                className={iconBtn}
-                title="Split at playhead"
-              >
-                <Scissors className="w-4 h-4" />
-              </button>
-              {loopButton}
-            </div>
-          </div>
-        )}
+        {hasSession && mobileTab !== 'home' && <MobileTransport {...transportProps} />}
 
         <nav className="h-14 shrink-0 grid grid-cols-6 border-t border-line bg-app pb-[env(safe-area-inset-bottom)]">
           {navItems.map(({ id, label, icon: Icon }) => (
@@ -1346,6 +1444,7 @@ export const App: React.FC = () => {
         handleImportAudioFiles(e.dataTransfer.files);
       }}
     >
+      {storageBanner}
       <input
         ref={fileInputRef}
         type="file"
@@ -1362,140 +1461,27 @@ export const App: React.FC = () => {
         onChange={(e) => handleImportProjectFileChange(e.target.files)}
       />
 
-      {/* Top bar */}
-      <header className="h-16 px-4 shrink-0 grid grid-cols-[1fr_auto_1fr] items-center border-b border-line bg-panel relative z-50">
-        <div className="flex items-center gap-2.5 min-w-0">
-          {logo}
-
-          <input
-            value={projectName}
-            onChange={(e) => setProjectName(e.target.value)}
-            title="Project name (auto-saved)"
-            className="w-32 xl:w-40 h-8 px-2.5 rounded-xl bg-app border border-line text-xs font-semibold text-ink outline-none focus:border-accent truncate"
-          />
-
-          {/* Home / Studio Switcher + Start From Scratch */}
-          <div className="flex items-center p-1 rounded-xl bg-app border border-line">
-            <button
-              onClick={() => setView('home')}
-              className={`flex items-center gap-1.5 h-7 px-3 rounded-lg text-xs font-semibold transition-colors ${
-                view === 'home' ? 'bg-raised text-ink' : 'text-mute hover:text-ink'
-              }`}
-            >
-              <HomeIcon className="w-3.5 h-3.5" />
-              Home
-            </button>
-            <button
-              onClick={() => setView('studio')}
-              className={`flex items-center gap-1.5 h-7 px-3 rounded-lg text-xs font-semibold transition-colors ${
-                view === 'studio' ? 'bg-raised text-ink' : 'text-mute hover:text-ink'
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5" />
-              Studio
-            </button>
-          </div>
-
-          <button
-            onClick={() => loadTemplate('scratch', false)}
-            title="Create a new blank project (keeps your previous projects saved)"
-            className="h-9 px-3 rounded-xl bg-raised hover:bg-[#2b2b31] text-xs font-semibold text-ink transition-colors shrink-0"
-          >
-            New Blank
-          </button>
-
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              onClick={handleUndo}
-              disabled={past.length === 0}
-              title="Undo (Ctrl+Z)"
-              className={iconBtn}
-            >
-              <Undo2 className="w-4 h-4" />
-            </button>
-            <button
-              onClick={handleRedo}
-              disabled={future.length === 0}
-              title="Redo (Ctrl+Y)"
-              className={iconBtn}
-            >
-              <Redo2 className="w-4 h-4" />
-            </button>
-          </div>
-
-          {saveBadgeButton}
-        </div>
-
-        {/* Transport */}
-        <div className="flex items-center gap-1.5">
-          <button onClick={handleRewind} title="Return to start" className={iconBtn}>
-            <SkipBack className="w-4 h-4" />
-          </button>
-          {playButton('w-11 h-11')}
-          {recordButton}
-          {countInButton}
-          {monitorButton}
-          {metronomeButton}
-          {loopButton}
-          <div className="ml-1 h-10 px-3.5 rounded-xl bg-app border border-line flex items-center gap-3">
-            <span className="font-mono text-[15px] font-medium tabular-nums">
-              {formatTimecode(playhead)}
-            </span>
-            <span className="w-px h-5 bg-line" />
-            <label className="flex items-center gap-1.5 text-xs text-mute">
-              <input
-                type="number"
-                min={60}
-                max={200}
-                value={bpm}
-                onChange={(e) =>
-                  setBpm(Math.max(60, Math.min(200, Number(e.target.value) || 120)))
-                }
-                className="w-10 bg-transparent font-mono text-[15px] font-medium text-ink outline-none tabular-nums"
-              />
-              BPM
-            </label>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-end gap-2">
-          <VisualizerDock isPlaying={isPlaying} onMeterUpdate={setMeterLevels} />
-          <button
-            onClick={() => setSnapToGrid((s) => !s)}
-            title="Snap to grid"
-            className={`${iconBtn} ${snapToGrid ? '!bg-white/10' : ''}`}
-          >
-            <Magnet className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => setPixelsPerSecond((p) => Math.max(35, p - 12))}
-            title="Zoom out"
-            className={iconBtn}
-          >
-            <ZoomOut className="w-4 h-4" />
-          </button>
-          <button
-            onClick={() => setPixelsPerSecond((p) => Math.min(200, p + 12))}
-            title="Zoom in"
-            className={iconBtn}
-          >
-            <ZoomIn className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleExportWav}
-            disabled={isExporting}
-            className="h-9 px-4 rounded-xl bg-accent text-white text-[13px] font-semibold flex items-center gap-2 hover:brightness-110 disabled:opacity-50"
-          >
-            <Download className="w-4 h-4" />
-            {isExporting ? 'Rendering…' : 'Export'}
-          </button>
-        </div>
-      </header>
+      <StudioHeader
+        {...transportProps}
+        {...projectChromeProps}
+        view={view}
+        onViewChange={setView}
+        bpm={bpm}
+        onBpmChange={setBpm}
+        snapToGrid={snapToGrid}
+        onToggleSnap={() => setSnapToGrid((v) => !v)}
+        onZoomIn={() => setPixelsPerSecond((v) => Math.min(200, v + 12))}
+        onZoomOut={() => setPixelsPerSecond((v) => Math.max(35, v - 12))}
+        isExporting={isExporting}
+        onExport={handleExport}
+      />
 
       {view === 'home' ? (
         <div className="flex-1 min-h-0">
           <Home {...homeProps} />
         </div>
+      ) : !hasSession ? (
+        noProjectState
       ) : (
         <div className="flex-1 min-h-0 flex">
           {/* Timeline */}

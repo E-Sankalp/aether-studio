@@ -3,20 +3,58 @@ import { Trash2 } from 'lucide-react';
 import { AudioClip, AudioTrack, LoopRegion } from '../types/audio';
 import { TimelineClipItem } from './TimelineClipItem';
 import { RangeInput } from './ParamSlider';
+import { meterStore, playheadStore, useLiveStore } from '../utils/liveStore';
+
+/** Playhead line: subscribes to the playhead store so the arrangement doesn't re-render per frame. */
+const PlayheadLine: React.FC<{ offsetPx: number; pps: number }> = ({ offsetPx, pps }) => {
+  const t = useLiveStore(playheadStore);
+  return (
+    <div
+      style={{ transform: `translateX(${offsetPx + t * pps}px)` }}
+      className="absolute top-0 bottom-0 left-0 w-px bg-accent z-[26] pointer-events-none will-change-transform"
+    />
+  );
+};
+
+const RecordingBlock: React.FC<{ startTime: number; pps: number }> = ({ startTime, pps }) => {
+  const t = useLiveStore(playheadStore);
+  return (
+    <div
+      style={{ left: startTime * pps, width: Math.max(4, (t - startTime) * pps) }}
+      className="absolute top-2 bottom-2 rounded-lg bg-accent/25 border border-accent overflow-hidden flex items-center px-2.5 text-[11px] font-semibold text-accent"
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse mr-1.5 shrink-0" />
+      <span className="truncate">Recording…</span>
+    </div>
+  );
+};
+
+/** Per-track level hairline (re-renders only when its own rounded level changes). */
+export const TrackLevelBar: React.FC<{ trackId: string; color: string; className?: string }> = ({
+  trackId,
+  color,
+  className = 'h-full',
+}) => {
+  const pct = useLiveStore(meterStore, (m) => Math.min(100, Math.round((m.trackLevels[trackId] || 0) * 100)));
+  return (
+    <div
+      className={`${className} transition-[width] duration-75`}
+      style={{ width: `${pct}%`, backgroundColor: color }}
+    />
+  );
+};
 
 interface ArrangementProps {
   tracks: AudioTrack[];
   clips: AudioClip[];
   selectedTrackId: string;
   selectedClipId: string;
-  playhead: number;
   loop: LoopRegion;
   bpm: number;
   pixelsPerSecond: number;
   durationSec: number;
   snapToGrid: boolean;
   compact?: boolean;
-  trackLevels: Record<string, number>;
   cornerSlot: React.ReactNode;
   onSelectTrack: (trackId: string) => void;
   onSelectClip: (clipId: string, trackId: string) => void;
@@ -33,14 +71,12 @@ export const Arrangement: React.FC<ArrangementProps> = ({
   clips,
   selectedTrackId,
   selectedClipId,
-  playhead,
   loop,
   bpm,
   pixelsPerSecond: pps,
   durationSec,
   snapToGrid,
   compact = false,
-  trackLevels,
   cornerSlot,
   onSelectTrack,
   onSelectClip,
@@ -121,7 +157,6 @@ export const Arrangement: React.FC<ArrangementProps> = ({
         <div className="relative">
           {tracks.map((track) => {
             const isSelected = track.id === selectedTrackId;
-            const level = trackLevels[track.id] || 0;
             return (
               <div
                 key={track.id}
@@ -216,10 +251,7 @@ export const Arrangement: React.FC<ArrangementProps> = ({
 
                   {/* Level meter hairline */}
                   <div className="absolute left-0 right-0 bottom-0 h-0.5 bg-transparent">
-                    <div
-                      className="h-full transition-[width] duration-75"
-                      style={{ width: `${Math.min(100, level * 100)}%`, backgroundColor: track.color }}
-                    />
+                    <TrackLevelBar trackId={track.id} color={track.color} />
                   </div>
                 </div>
 
@@ -239,21 +271,12 @@ export const Arrangement: React.FC<ArrangementProps> = ({
                         isSelected={clip.id === selectedClipId}
                         snapToGrid={snapToGrid}
                         bpm={bpm}
-                        onSelect={(id) => onSelectClip(id, track.id)}
+                        onSelectClip={onSelectClip}
                         onUpdateClip={onUpdateClip}
                       />
                     ))}
                   {recording && recording.trackId === track.id && (
-                    <div
-                      style={{
-                        left: recording.startTime * pps,
-                        width: Math.max(4, (playhead - recording.startTime) * pps),
-                      }}
-                      className="absolute top-2 bottom-2 rounded-lg bg-accent/25 border border-accent overflow-hidden flex items-center px-2.5 text-[11px] font-semibold text-accent"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse mr-1.5 shrink-0" />
-                      <span className="truncate">Recording…</span>
-                    </div>
+                    <RecordingBlock startTime={recording.startTime} pps={pps} />
                   )}
                 </div>
               </div>
@@ -261,10 +284,7 @@ export const Arrangement: React.FC<ArrangementProps> = ({
           })}
 
           {/* Playhead */}
-          <div
-            style={{ left: headerW + playhead * pps }}
-            className="absolute top-0 bottom-0 w-px bg-accent z-[26] pointer-events-none"
-          />
+          <PlayheadLine offsetPx={headerW} pps={pps} />
         </div>
       </div>
     </div>

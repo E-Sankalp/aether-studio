@@ -8,7 +8,6 @@ import {
   HardDrive,
   Headphones,
   Mic,
-  Music2,
   Plus,
   Radio,
   Trash2,
@@ -39,6 +38,7 @@ const TEMPLATES: {
   includes: string;
   icon: LucideIcon;
   color: string;
+  image: string;
 }[] = [
   {
     id: 'singing',
@@ -47,6 +47,7 @@ const TEMPLATES: {
     includes: 'Studio singer preset · Backing lane',
     icon: Mic,
     color: '#f12c4c',
+    image: '/images/singing.jpg',
   },
   {
     id: 'podcast',
@@ -55,6 +56,7 @@ const TEMPLATES: {
     includes: 'Podcast preset · Host, Guest, Music',
     icon: Radio,
     color: '#ff8a1f',
+    image: '/images/podcast.jpg',
   },
   {
     id: 'story',
@@ -63,6 +65,7 @@ const TEMPLATES: {
     includes: 'Storyteller preset · Ambience lane',
     icon: BookOpen,
     color: '#2ecc71',
+    image: '/images/story.jpg',
   },
   {
     id: 'demo',
@@ -71,6 +74,7 @@ const TEMPLATES: {
     includes: 'Drums · Bass · Chords · Lead',
     icon: Headphones,
     color: '#1fb6ff',
+    image: '/images/demo.jpg',
   },
 ];
 
@@ -102,14 +106,7 @@ export const Home: React.FC<HomeProps> = ({
 }) => (
   <div className="h-full overflow-y-auto bg-app text-ink">
     <div className="max-w-4xl mx-auto px-5 py-8 md:py-12">
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-8">
-        <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 rounded-xl bg-accent flex items-center justify-center">
-            <Music2 className="w-5 h-5 text-white" />
-          </div>
-          <span className="text-lg font-bold tracking-tight">Aether</span>
-        </div>
-
+      <div className="flex flex-wrap items-center justify-end gap-3 mb-6">
         <div className="flex flex-wrap items-center gap-2">
           <span
             title="All tracks, settings, and recordings stay saved on your device until you delete them"
@@ -130,21 +127,41 @@ export const Home: React.FC<HomeProps> = ({
         </div>
       </div>
 
-      <h1 className="text-3xl md:text-4xl font-bold tracking-tight">What will you create?</h1>
-      <p className="text-mute mt-2 mb-8 text-[15px]">
-        Start from a blank canvas, pick a template, or open any of your permanently saved projects.
-      </p>
+      {/* Hero banner */}
+      <div className="relative overflow-hidden rounded-3xl border border-white/10 mb-8 min-h-[220px] md:min-h-[300px] flex items-end md:items-center shadow-2xl shadow-black/50">
+        <img
+          src="/images/hero.jpg"
+          alt=""
+          className="absolute inset-0 w-full h-full object-cover object-right"
+        />
+        <div className="absolute inset-0 bg-gradient-to-r from-app via-app/80 to-transparent md:via-app/60" />
+        <div className="absolute inset-0 bg-gradient-to-t from-app/80 via-transparent to-transparent" />
+        <div className="relative p-6 md:p-10 max-w-xl">
+          <span className="inline-flex items-center gap-1.5 h-7 px-3 rounded-full glass text-[11px] font-semibold uppercase tracking-[0.16em] text-white/80 mb-4">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+            Your pocket studio
+          </span>
+          <h1 className="text-3xl md:text-5xl font-extrabold tracking-tight leading-[1.05]">
+            What will you <span className="brand-text-accent">create</span>?
+          </h1>
+          <p className="text-white/70 mt-3 text-[15px]">
+            Record vocals, build beats and mix songs. Start from scratch, pick a template, or open
+            a saved project.
+          </p>
+        </div>
+      </div>
 
       {/* Primary actions */}
       <div className="grid gap-3 md:grid-cols-3 mb-10">
         <button
           onClick={() => onStart('scratch')}
-          className="md:col-span-1 text-left rounded-3xl bg-accent p-5 flex flex-col justify-between min-h-[150px] hover:brightness-110 transition"
+          className="card-hover relative overflow-hidden md:col-span-1 text-left rounded-3xl brand-gradient p-5 flex flex-col justify-between min-h-[150px] shadow-xl shadow-accent/25"
         >
-          <span className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center">
+          <span className="pointer-events-none absolute -right-8 -top-10 w-40 h-40 rounded-full bg-white/15 blur-2xl" />
+          <span className="relative w-10 h-10 rounded-2xl bg-white/20 ring-1 ring-white/25 flex items-center justify-center">
             <Plus className="w-5 h-5 text-white" />
           </span>
-          <span>
+          <span className="relative">
             <span className="block text-lg font-bold text-white">Start from scratch</span>
             <span className="block text-sm text-white/80 mt-0.5">
               Creates a new blank project (keeps your old projects saved)
@@ -154,10 +171,10 @@ export const Home: React.FC<HomeProps> = ({
 
         <button
           onClick={onImport}
-          className="text-left rounded-3xl bg-panel border border-line p-5 flex flex-col justify-between min-h-[150px] hover:bg-raised transition-colors"
+          className="card-hover text-left rounded-3xl glass p-5 flex flex-col justify-between min-h-[150px]"
         >
           <span className="w-10 h-10 rounded-2xl bg-raised flex items-center justify-center">
-            <Upload className="w-5 h-5" />
+            <Upload className="w-5 h-5 text-accent" />
           </span>
           <span>
             <span className="block text-lg font-bold">Import audio</span>
@@ -170,10 +187,10 @@ export const Home: React.FC<HomeProps> = ({
         {trackCount > 0 ? (
           <button
             onClick={onContinue}
-            className="text-left rounded-3xl bg-panel border border-line p-5 flex flex-col justify-between min-h-[150px] hover:bg-raised transition-colors"
+            className="card-hover text-left rounded-3xl glass p-5 flex flex-col justify-between min-h-[150px]"
           >
             <span className="w-10 h-10 rounded-2xl bg-raised flex items-center justify-center">
-              <ArrowRight className="w-5 h-5" />
+              <ArrowRight className="w-5 h-5 text-accent" />
             </span>
             <span>
               <span className="block text-lg font-bold">Continue current session</span>
@@ -288,19 +305,28 @@ export const Home: React.FC<HomeProps> = ({
       {/* Templates */}
       <h2 className="text-sm font-semibold uppercase tracking-wider text-mute mb-3">Templates</h2>
       <div className="grid gap-3 sm:grid-cols-2">
-        {TEMPLATES.map(({ id, title, desc, includes, icon: Icon, color }) => (
+        {TEMPLATES.map(({ id, title, desc, includes, icon: Icon, color, image }) => (
           <button
             key={id}
             onClick={() => onStart(id)}
-            className="text-left rounded-2xl bg-panel border border-line p-4 flex gap-4 hover:bg-raised transition-colors"
+            className="card-hover group text-left rounded-2xl bg-panel border border-line overflow-hidden flex flex-col"
           >
-            <span
-              className="w-12 h-12 rounded-xl shrink-0 flex items-center justify-center"
-              style={{ backgroundColor: `${color}26`, color }}
-            >
-              <Icon className="w-6 h-6" />
+            <span className="relative block h-36 overflow-hidden">
+              <img
+                src={image}
+                alt=""
+                loading="lazy"
+                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+              />
+              <span className="absolute inset-0 bg-gradient-to-t from-panel via-panel/20 to-transparent" />
+              <span
+                className="absolute left-4 bottom-3 w-10 h-10 rounded-xl flex items-center justify-center backdrop-blur-md ring-1 ring-white/15"
+                style={{ backgroundColor: `${color}55`, color: '#fff' }}
+              >
+                <Icon className="w-5 h-5" />
+              </span>
             </span>
-            <span className="min-w-0">
+            <span className="block p-4 pt-3">
               <span className="block text-[15px] font-semibold">{title}</span>
               <span className="block text-[13px] text-mute mt-0.5 leading-snug">{desc}</span>
               <span className="block text-[11px] text-mute/80 font-mono mt-2">{includes}</span>
