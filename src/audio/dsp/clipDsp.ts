@@ -3,6 +3,7 @@
  * operating on plain Float32Array channels so nothing blocks the UI thread.
  */
 import type { ClipProcessSettings } from '../../types/audio';
+import { deEss, psolaAutotune, spectralDenoise } from './vocalDsp';
 
 export interface ClipRenderRequest {
   channels: Float32Array[];
@@ -32,56 +33,6 @@ export function isDefaultProcesses(p: ClipProcessSettings): boolean {
 }
 
 /* --------------------------------- helpers --------------------------------- */
-
-function detectPitchHz(frame: Float32Array, sampleRate: number): number | null {
-  let rms = 0;
-  for (let i = 0; i < frame.length; i++) rms += frame[i] * frame[i];
-  rms = Math.sqrt(rms / frame.length);
-  if (rms < 0.015) return null; // unvoiced or silence
-
-  const minLag = Math.floor(sampleRate / 850); // max ~850 Hz
-  const maxLag = Math.min(frame.length - 2, Math.floor(sampleRate / 75)); // min ~75 Hz
-  let bestLag = -1;
-  let bestCorr = 0;
-
-  for (let lag = minLag; lag <= maxLag; lag++) {
-    let sum = 0;
-    let normA = 0;
-    let normB = 0;
-    const n = frame.length - lag;
-    for (let i = 0; i < n; i += 2) {
-      const a = frame[i];
-      const b = frame[i + lag];
-      sum += a * b;
-      normA += a * a;
-      normB += b * b;
-    }
-    const denom = Math.sqrt(normA * normB);
-    const corr = denom > 0.00001 ? sum / denom : 0;
-    if (corr > bestCorr) {
-      bestCorr = corr;
-      bestLag = lag;
-    }
-  }
-  return bestLag > 0 && bestCorr > 0.55 ? sampleRate / bestLag : null;
-}
-
-function snapMidiToScale(midiFloat: number, semitones: number[]): number {
-  const scale = semitones.length > 0 ? semitones : [0, 2, 4, 5, 7, 9, 11];
-  const nearestInt = Math.round(midiFloat);
-  const octave = Math.floor(nearestInt / 12);
-  const pc = ((nearestInt % 12) + 12) % 12;
-  let bestPc = scale[0];
-  let minDist = 99;
-  for (const st of scale) {
-    const dist = Math.abs(st - pc);
-    if (dist < minDist) {
-      minDist = dist;
-      bestPc = st;
-    }
-  }
-  return octave * 12 + bestPc;
-}
 
 function hann(n: number): Float32Array {
   // Periodic Hann: overlaps at 50 % sum to a constant
@@ -267,88 +218,26 @@ export function renderClipChannels(req: ClipRenderRequest): Float32Array[] {
   const count = endSample - startSample;
   if (count <= 1 || isDefaultProcesses(processes)) return channels;
 
-  // 1. Noise Removal (0..100%)
+  // 1. Noise Removal (0..100%): spectral noise reduction with a learned noise profile
   if (processes.denoise > 0) {
     const amt = Math.min(1, processes.denoise / 100);
-    const threshold = 0.015 + amt * 0.065;
-    for (const data of channels) {
-      const copy = data.slice(startSample, endSample);
-      let env = 0;
-      for (let i = 0; i < count; i++) {
-        const abs = Math.abs(copy[i]);
-        env = env * 0.985 + abs * 0.015;
-        const gateGain = env < threshold ? Math.pow(env / threshold, 1.5 + amt * 2.2) : 1.0;
-        const prev = i > 0 ? copy[i - 1] : copy[i];
-        const next = i < count - 1 ? copy[i + 1] : copy[i];
-        const smoothed = copy[i] * (1 - amt * 0.45) + (prev + next) * (amt * 0.225);
-        data[startSample + i] = copy[i] * (1 - amt) + smoothed * gateGain * amt;
-      }
-    }
+    for (const data of channels) spectralDenoise(data, startSample, endSample, amt);
   }
 
-  // 2. Voice Soften (0..100%)
+  // 2. Voice Soften (0..100%): dynamic de-esser (only acts on "s"/"sh" sounds)
   if (processes.voiceSoften > 0) {
     const amt = Math.min(1, processes.voiceSoften / 100);
-    for (const data of channels) {
-      const copy = data.slice(startSample, endSample);
-      let lpState = 0;
-      for (let i = 0; i < count; i++) {
-        const x = copy[i];
-        lpState = lpState * (0.65 + amt * 0.2) + x * (0.35 - amt * 0.2);
-        const highTransient = x - lpState;
-        const softenedHigh = Math.tanh(highTransient * 1.5) * (0.5 - amt * 0.28);
-        const wet = Math.tanh((lpState * (1 + amt * 0.2) + softenedHigh) * 1.04);
-        data[startSample + i] = x * (1 - amt) + wet * amt;
-      }
-    }
+    for (const data of channels) deEss(data, startSample, endSample, sr, amt);
   }
 
-  // 3. Auto-Pitch Tune (0..100%)
+  // 3. Auto-Pitch Tune (0..100%): PSOLA pitch correction that keeps the voice's formants.
+  //    Higher amounts also retune faster (100 % = hard "auto-tune" effect).
   if (processes.autoPitch > 0) {
-    const frameSize = Math.floor(sr * 0.04);
-    const hopSize = Math.floor(frameSize / 2);
     const strength = Math.max(0.05, Math.min(1, processes.autoPitch / 100));
-    const ch0 = channels[0].slice(startSample, endSample);
-    const numHops = Math.max(1, Math.floor((count - frameSize) / hopSize));
-    const ratios = new Float32Array(numHops);
-    let prevRatio = 1.0;
-
-    for (let h = 0; h < numHops; h++) {
-      const offset = h * hopSize;
-      const f0 = detectPitchHz(ch0.subarray(offset, offset + frameSize), sr);
-      if (f0) {
-        const midiFloat = 69 + 12 * Math.log2(f0 / 440);
-        const targetMidi = snapMidiToScale(midiFloat, scaleSemitones);
-        const targetFreq = 440 * Math.pow(2, (targetMidi - 69) / 12);
-        const rawRatio = Math.max(0.75, Math.min(1.35, targetFreq / f0));
-        const blended = 1.0 + (rawRatio - 1.0) * strength;
-        prevRatio = prevRatio * 0.25 + blended * 0.75;
-        ratios[h] = prevRatio;
-      } else {
-        ratios[h] = 1.0;
-      }
-    }
-
+    const speed = 0.35 + 0.65 * strength;
     for (const data of channels) {
-      const orig = data.slice(startSample, endSample);
-      const out = new Float32Array(count);
-      const weight = new Float32Array(count);
-      for (let h = 0; h < numHops; h++) {
-        const offset = h * hopSize;
-        const ratio = ratios[h];
-        for (let i = 0; i < frameSize && offset + i < count; i++) {
-          const win = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (frameSize - 1)));
-          const srcPos = offset + i * ratio;
-          const idx0 = Math.min(count - 1, Math.floor(srcPos));
-          const idx1 = Math.min(count - 1, idx0 + 1);
-          const frac = srcPos - idx0;
-          out[offset + i] += (orig[idx0] * (1 - frac) + orig[idx1] * frac) * win;
-          weight[offset + i] += win;
-        }
-      }
-      for (let i = 0; i < count; i++) {
-        data[startSample + i] = weight[i] > 0.01 ? out[i] / weight[i] : orig[i];
-      }
+      const tuned = psolaAutotune(data, startSample, endSample, sr, scaleSemitones, strength, speed);
+      data.set(tuned, startSample);
     }
   }
 

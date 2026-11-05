@@ -17,12 +17,14 @@ export const VisualizerDock: React.FC<VisualizerDockProps> = ({ isPlaying }) => 
     m.masterRmsDb <= -59 ? '-∞' : (m.masterRmsDb - 0.7).toFixed(1)
   );
 
+  // Draws only while audio plays (+1.5 s tail as it decays); idle = no animation loop at all
   useEffect(() => {
     let animId = 0;
     const freqData = new Uint8Array(1024);
     const timeData = new Uint8Array(1024);
+    const stopAt = isPlaying ? Infinity : performance.now() + 1500;
 
-    const render = () => {
+    const render = (now: number) => {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (canvas && ctx) {
@@ -68,7 +70,7 @@ export const VisualizerDock: React.FC<VisualizerDockProps> = ({ isPlaying }) => 
           ctx.restore();
         }
       }
-      animId = requestAnimationFrame(render);
+      if (now < stopAt) animId = requestAnimationFrame(render);
     };
 
     animId = requestAnimationFrame(render);

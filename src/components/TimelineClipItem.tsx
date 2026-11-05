@@ -9,8 +9,16 @@ interface TimelineClipItemProps {
   isSelected: boolean;
   snapToGrid: boolean;
   bpm: number;
-  onSelectClip: (clipId: string, trackId: string) => void;
+  onSelectClip: (clipId: string, trackId: string, mode?: 'toggle' | 'press' | 'click') => void;
+  /** Body drag (moves the selection as a group). Falls back to moving just this clip. */
+  onDragMove?: (clipId: string, dtSec: number) => void;
   onUpdateClip: (clipId: string, patch: Partial<AudioClip>, commitHistory?: boolean) => void;
+  /** Called when a move/trim gesture ends (the app resolves overlaps on drop). */
+  onDragEnd?: (clipId: string) => void;
+  /** End of the previous clip on this track (trims can't go past it) */
+  prevEnd?: number;
+  /** Start of the next clip on this track (trims can't go past it) */
+  nextStart?: number;
 }
 
 const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
@@ -21,8 +29,12 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
   bpm,
   onSelectClip,
   onUpdateClip,
+  onDragEnd,
+  onDragMove,
+  prevEnd = 0,
+  nextStart = Infinity,
 }) => {
-  const onSelect = (clipId: string) => onSelectClip(clipId, clip.trackId);
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const buffer = audioEngine.getBuffer(clip.bufferId);
 
@@ -68,12 +80,21 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
   ) => {
     e.stopPropagation();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    onSelect(clip.id);
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    onSelectClip(clip.id, clip.trackId, additive ? 'toggle' : 'press');
+    let moved = false;
+    const move = (pe: PointerEvent) => {
+      moved = true;
+      onMove(pe);
     };
-    window.addEventListener('pointermove', onMove);
+    const onUp = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', onUp);
+      if (moved) onDragEnd?.(clip.id);
+      // A plain click (no drag) on a multi-selection selects just this clip
+      else if (!additive) onSelectClip(clip.id, clip.trackId, 'click');
+    };
+    window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', onUp);
   };
 
@@ -82,7 +103,8 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
     const origStart = clip.startTime;
     startDrag(e, (pe) => {
       const dt = (pe.clientX - startX) / pixelsPerSecond;
-      onUpdateClip(clip.id, { startTime: snapTime(origStart + dt) }, false);
+      if (onDragMove) onDragMove(clip.id, dt);
+      else onUpdateClip(clip.id, { startTime: snapTime(origStart + dt) }, false);
     });
   };
 
@@ -93,8 +115,12 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
     const origDur = clip.duration;
     startDrag(e, (pe) => {
       const dt = (pe.clientX - startX) / pixelsPerSecond;
-      const clampedDt = Math.max(-origOffset / clip.playbackRate, Math.min(origDur - 0.15, dt));
-      const nextStart = snapTime(origStart + clampedDt);
+      const clampedDt = Math.max(
+        -origOffset / clip.playbackRate,
+        prevEnd - origStart,
+        Math.min(origDur - 0.15, dt)
+      );
+      const nextStart = Math.max(prevEnd, snapTime(origStart + clampedDt));
       const actualDt = nextStart - origStart;
       onUpdateClip(
         clip.id,
@@ -114,7 +140,8 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
     const maxAvailDur = buffer ? (buffer.duration - clip.offset) / clip.playbackRate : origDur;
     startDrag(e, (pe) => {
       const dt = (pe.clientX - startX) / pixelsPerSecond;
-      onUpdateClip(clip.id, { duration: Math.max(0.15, Math.min(maxAvailDur, origDur + dt)) }, false);
+      const maxDur = Math.min(maxAvailDur, nextStart - clip.startTime);
+      onUpdateClip(clip.id, { duration: Math.max(0.15, Math.min(maxDur, origDur + dt)) }, false);
     });
   };
 
@@ -139,6 +166,7 @@ const TimelineClipItemImpl: React.FC<TimelineClipItemProps> = ({
 
   return (
     <div
+      data-clip-id={clip.id}
       onPointerDown={handleBodyPointerDown}
       style={{ left: `${leftPx}px`, width: `${widthPx}px`, backgroundColor: clip.color }}
       className={`absolute top-2 bottom-2 rounded-lg overflow-hidden cursor-grab active:cursor-grabbing touch-none group ${

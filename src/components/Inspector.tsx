@@ -49,7 +49,7 @@ const Section: React.FC<{
 }> = ({ title, defaultOpen = false, right, children }) => {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="rounded-2xl bg-panel border border-line overflow-hidden">
+    <section className="cv-auto rounded-2xl bg-panel border border-line overflow-hidden">
       <div
         role="button"
         tabIndex={0}
@@ -170,6 +170,8 @@ interface EditPanelProps {
   onUpdateClipProcesses: (patch: Partial<ClipProcessSettings>) => void;
   /** Duration-preserving transpose, rendered off-thread when the slider is released */
   onCommitClipPitch: (semitones: number) => void;
+  /** Loop-recorded clips: switch to another take */
+  onSelectTake: (clipId: string, takeIndex: number) => void;
   /** True while the selected clip is being re-rendered in the background */
   isRenderingClip: boolean;
   onSplit: () => void;
@@ -186,6 +188,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
   onUpdateClip,
   onUpdateClipProcesses,
   onCommitClipPitch,
+  onSelectTake,
   isRenderingClip,
   onSplit,
   onDuplicate,
@@ -586,6 +589,36 @@ const EditPanel: React.FC<EditPanelProps> = ({
           <ActionButton icon={VolumeX} label="Silence region" onClick={() => onApplyBufferOp('silence')} />
         </div>
 
+        {/* Loop-recording takes (comping) */}
+        {selectedClip.takes && selectedClip.takes.length > 1 && (
+          <div className="pt-2 pb-3 border-t border-line">
+            <div className="text-[11px] font-semibold text-mute uppercase tracking-wider mb-1">
+              Takes
+            </div>
+            <p className="text-[11px] text-mute leading-relaxed mb-2">
+              Pick the best take. To comp, split the clip (S) and choose a take for each part.
+            </p>
+            <div className="grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Takes">
+              {selectedClip.takes.map((take, i) => {
+                const active = (selectedClip.activeTake ?? selectedClip.takes!.length - 1) === i;
+                return (
+                  <button
+                    key={take.bufferId}
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => onSelectTake(selectedClip.id, i)}
+                    className={`h-8 rounded-lg text-[11px] font-semibold transition-colors ${
+                      active ? 'bg-accent text-white' : 'bg-raised text-ink hover:bg-[#2b2b31]'
+                    }`}
+                  >
+                    {take.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Fine-Tune Process Sliders */}
         <div className="pt-2 border-t border-line">
           <div className="text-[11px] font-semibold text-mute uppercase tracking-wider mb-1 flex items-center justify-between">
@@ -831,9 +864,9 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
 
         <div className="relative h-20 rounded-xl bg-panel border border-line overflow-hidden">
           <canvas ref={eqCanvasRef} className="w-full h-full block" />
-          <div className="absolute top-1.5 left-2.5 right-2.5 flex items-center justify-between text-[10px] font-mono text-mute pointer-events-none">
-            <span>Live Tone & Vocal Filter Curve</span>
-            <span>
+          <div className="absolute top-1.5 left-2.5 right-2.5 flex items-center justify-between gap-3 text-[10px] text-mute pointer-events-none">
+            <span className="font-semibold uppercase tracking-wider truncate">Tone curve</span>
+            <span className="font-mono shrink-0">
               Soften {Math.round(fx.voiceSoftener ?? 0)}% · Denoise {Math.round(fx.noiseRemoval ?? 0)}%
             </span>
           </div>
@@ -1129,7 +1162,7 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
           <div
             key={track.id}
             onClick={() => onUpdateTrack(track.id, {})}
-            className={`rounded-2xl bg-panel border px-4 py-3 ${
+            className={`cv-auto rounded-2xl bg-panel border px-4 py-3 ${
               selectedTrack?.id === track.id ? 'border-white/30' : 'border-line'
             }`}
           >
@@ -1190,6 +1223,32 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
               }
               onChange={(v) => onUpdateTrack(track.id, { pan: v })}
             />
+            <div className="grid grid-cols-2 gap-x-3">
+              <ParamSlider
+                label="Reverb send"
+                value={track.sends?.reverb ?? 0}
+                min={0}
+                max={1}
+                step={0.01}
+                defaultValue={0}
+                format={(v) => `${Math.round(v * 100)}%`}
+                onChange={(v) =>
+                  onUpdateTrack(track.id, { sends: { reverb: v, delay: track.sends?.delay ?? 0 } })
+                }
+              />
+              <ParamSlider
+                label="Delay send"
+                value={track.sends?.delay ?? 0}
+                min={0}
+                max={1}
+                step={0.01}
+                defaultValue={0}
+                format={(v) => `${Math.round(v * 100)}%`}
+                onChange={(v) =>
+                  onUpdateTrack(track.id, { sends: { reverb: track.sends?.reverb ?? 0, delay: v } })
+                }
+              />
+            </div>
           </div>
         );
       })}

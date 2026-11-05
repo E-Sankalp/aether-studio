@@ -121,6 +121,18 @@ export interface AudioClip {
   playbackRate: number;
   /** Accent color hex */
   color: string;
+  /**
+   * Loop-recording takes: alternative recordings of the same region (same length/alignment).
+   * The active take's audio is `sourceBufferId`/`bufferId`. Split the clip to comp sections.
+   */
+  takes?: ClipTake[];
+  /** Index into `takes` of the take currently used */
+  activeTake?: number;
+}
+
+export interface ClipTake {
+  bufferId: string;
+  label: string;
 }
 
 export interface AudioTrack {
@@ -133,7 +145,65 @@ export interface AudioTrack {
   solo: boolean;
   armed: boolean;
   effects: TrackEffects;
+  /** Post-fader send levels to the shared FX return buses (0 to 1) */
+  sends?: TrackSends;
+  /** Automation lanes (timeline seconds -> value) */
+  automation?: TrackAutomation;
+  /** Automation lane visible under the track */
+  showAutomation?: boolean;
 }
+
+export interface TrackSends {
+  reverb: number;
+  delay: number;
+}
+
+/** One automation breakpoint: at timeline time `t` (s) the value is `v`. */
+export interface AutomationPoint {
+  t: number;
+  v: number;
+}
+
+export interface TrackAutomation {
+  /** Volume multiplier on top of the fader (0 to 1.5, 1 = unchanged), linear between points */
+  volume?: AutomationPoint[];
+}
+
+export type DelayDivision = '1/2' | '1/4' | '1/4d' | '1/8' | '1/8d' | '1/16';
+
+/** Shared FX return buses (project-wide): one reverb, one tempo-synced delay. */
+export interface FxReturns {
+  /** Reverb decay time (RT60) in seconds, 0.4 to 6 */
+  reverbSize: number;
+  /** Reverb pre-delay in ms, 0 to 150 */
+  reverbPreDelayMs: number;
+  /** Reverb brightness 0 (dark) to 100 (bright) */
+  reverbTone: number;
+  /** Reverb return level 0 to 1.5 */
+  reverbLevel: number;
+  /** Delay time as a note value at the project tempo */
+  delayDivision: DelayDivision;
+  /** Delay feedback 0 to 0.85 */
+  delayFeedback: number;
+  /** Delay repeat brightness 0 to 100 */
+  delayTone: number;
+  /** Delay return level 0 to 1.5 */
+  delayLevel: number;
+  /** Alternate repeats left/right */
+  delayPingPong: boolean;
+}
+
+export const DEFAULT_RETURNS: FxReturns = {
+  reverbSize: 2.2,
+  reverbPreDelayMs: 20,
+  reverbTone: 60,
+  reverbLevel: 1,
+  delayDivision: '1/8d',
+  delayFeedback: 0.32,
+  delayTone: 55,
+  delayLevel: 1,
+  delayPingPong: true,
+};
 
 export interface LoopRegion {
   enabled: boolean;

@@ -3,6 +3,8 @@ import {
   AudioTrack,
   BufferOperationType,
   ClipProcessSettings,
+  DEFAULT_RETURNS,
+  FxReturns,
   LoopRegion,
   LoudnessReport,
   MasterSettings,
@@ -20,12 +22,17 @@ import {
   masterBuffer,
 } from './mastering';
 import { ClipRenderRequest, isDefaultProcesses, renderClipChannels } from './dsp/clipDsp';
+import { createReturnBuses, mulberry32, ReturnBuses } from './fxReturns';
+import { scheduleAutomation, valueAt } from './automation';
+import { DEESSER_WORKLET_SOURCE } from './dsp/deEsserWorklet';
 
 interface TrackGraphNodes {
   input: GainNode;
   rawDryGain: GainNode;
   rumbleHighpass: BiquadFilterNode;
   hissLowpass: BiquadFilterNode;
+  /** Dynamic de-esser (AudioWorklet; a pass-through GainNode if worklets are unavailable) */
+  deEsserDyn: AudioNode;
   deEsserFilter: BiquadFilterNode;
   harshCutFilter: BiquadFilterNode;
   vocalWarmthFilter: BiquadFilterNode;
@@ -55,7 +62,12 @@ interface TrackGraphNodes {
   reverbWet: GainNode;
   sumNode: GainNode;
   volumeNode: GainNode;
+  /** Volume automation multiplier (1 = no change), between the fader and the panner */
+  autoGain: GainNode;
   pannerNode: StereoPannerNode;
+  /** Post-fader sends to the shared FX return buses */
+  sendReverb: GainNode;
+  sendDelay: GainNode;
   analyser: AnalyserNode;
   currentReverbDecay: number;
 }
@@ -159,6 +171,13 @@ export class StudioAudioEngine {
 
   private masterGain: GainNode | null = null;
   private masterChain: MasterChainNodes | null = null;
+  private returnBuses: ReturnBuses | null = null;
+  // DSP worklet module (de-esser), loaded once per AudioContext / OfflineAudioContext
+  private dspModuleUrl: string | null = null;
+  private dspReady = new WeakSet<BaseAudioContext>();
+  private dspLoading = new WeakMap<BaseAudioContext, Promise<void>>();
+  private lastSyncedTracks: AudioTrack[] = [];
+  private returns: FxReturns = DEFAULT_RETURNS;
   private masterSettings: MasterSettings = DEFAULT_MASTER;
   private masterPreviewMakeupDb = 0;
   private masterAnalyser: AnalyserNode | null = null;
@@ -206,6 +225,10 @@ export class StudioAudioEngine {
 
       this.masterGain = this.ctx.createGain();
       this.masterGain.gain.value = 1.0;
+
+      // Shared reverb + delay returns, fed by every track's post-fader sends
+      this.returnBuses = createReturnBuses(this.ctx, this.returns, this.currentBpm);
+      this.returnBuses.output.connect(this.masterGain);
 
       this.masterChain = createMasterChain(this.ctx, true);
       applyMasterChain(
@@ -264,6 +287,13 @@ export class StudioAudioEngine {
    * Applies mastering settings to the live master bus. `previewMakeupDb` is the loudness gain the
    * export would apply (from the last analysis), so playback roughly matches the exported master.
    */
+  /** Updates the shared reverb/delay returns (the delay follows `bpm`). */
+  public setReturns(returns: FxReturns, bpm: number): void {
+    this.returns = returns;
+    this.currentBpm = bpm;
+    this.returnBuses?.apply(returns, bpm);
+  }
+
   public setMasterSettings(
     settings: MasterSettings,
     previewMakeupDb = this.masterPreviewMakeupDb
@@ -323,6 +353,50 @@ export class StudioAudioEngine {
     return this.latencySettings.mode === 'manual'
       ? this.latencySettings.manualMs / 1000
       : this.getAutoLatencyMs() / 1000;
+  }
+
+  /** Loads the DSP worklet module into `ctx` (no-op if already loaded or unsupported). */
+  private ensureDspModule(ctx: BaseAudioContext): Promise<void> {
+    if (this.dspReady.has(ctx) || !('audioWorklet' in ctx) || !ctx.audioWorklet) {
+      return Promise.resolve();
+    }
+    let loading = this.dspLoading.get(ctx);
+    if (!loading) {
+      if (!this.dspModuleUrl) {
+        this.dspModuleUrl = URL.createObjectURL(
+          new Blob([DEESSER_WORKLET_SOURCE], { type: 'application/javascript' })
+        );
+      }
+      loading = ctx.audioWorklet
+        .addModule(this.dspModuleUrl)
+        .then(() => {
+          this.dspReady.add(ctx);
+        })
+        .catch((err) => {
+          console.warn('DSP worklet unavailable; using static voice softener', err);
+        });
+      this.dspLoading.set(ctx, loading);
+    }
+    return loading;
+  }
+
+  /**
+   * Call once at startup: loads the live DSP worklets. Track chains built before this finished
+   * are rebuilt so they get the dynamic de-esser too.
+   */
+  public async prepareDsp(): Promise<void> {
+    const ctx = this.getContext();
+    const wasReady = this.dspReady.has(ctx);
+    await this.ensureDspModule(ctx);
+    if (!wasReady && this.dspReady.has(ctx) && this.trackNodes.size > 0 && !this.isPlaying) {
+      for (const nodes of this.trackNodes.values()) {
+        try {
+          nodes.pannerNode.disconnect();
+        } catch {}
+      }
+      this.trackNodes.clear();
+      this.syncTracks(this.lastSyncedTracks);
+    }
   }
 
   private ensureCaptureModule(ctx: AudioContext): Promise<void> {
@@ -577,18 +651,21 @@ export class StudioAudioEngine {
   }
 
   private createDistortionCurve(drivePercent: number): Float32Array {
-    const samples = 1024;
+    // Odd length + x spanning exactly [-1, 1] puts x = 0 on the centre sample, so silence maps
+    // to exactly 0. (The old even-length curve mapped 0 to -0.001: a constant DC offset on every
+    // track that showed as a -42 dB "signal" on the meter and went into every export.)
+    const samples = 1025;
     const curve = new Float32Array(samples);
     const k = (drivePercent / 100) * 65;
     if (k <= 0.1) {
       for (let i = 0; i < samples; i++) {
-        curve[i] = (i * 2) / samples - 1;
+        curve[i] = (i * 2) / (samples - 1) - 1;
       }
       return curve;
     }
     const deg = Math.PI / 180;
     for (let i = 0; i < samples; i++) {
-      const x = (i * 2) / samples - 1;
+      const x = (i * 2) / (samples - 1) - 1;
       curve[i] = ((3 + k) * x * 20 * deg) / (Math.PI + k * Math.abs(x));
     }
     return curve;
@@ -601,13 +678,16 @@ export class StudioAudioEngine {
     const impulse = ctx.createBuffer(2, length, rate);
     const left = impulse.getChannelData(0);
     const right = impulse.getChannelData(1);
+    // Seeded noise: the same settings always produce the same reverb (playback == export)
+    const randL = mulberry32(Math.round(duration * 1000));
+    const randR = mulberry32(Math.round(duration * 1000) + 7);
 
     for (let i = 0; i < length; i++) {
       const t = i / length;
       const env = Math.pow(1 - t, 2.4);
       const earlyBoost = i < rate * 0.04 && i % 180 === 0 ? 1.6 : 1.0;
-      left[i] = (Math.random() * 2 - 1) * env * earlyBoost * 0.65;
-      right[i] = (Math.random() * 2 - 1) * env * earlyBoost * 0.65;
+      left[i] = (randL() * 2 - 1) * env * earlyBoost * 0.65;
+      right[i] = (randR() * 2 - 1) * env * earlyBoost * 0.65;
     }
     return impulse;
   }
@@ -616,7 +696,8 @@ export class StudioAudioEngine {
     ctx: BaseAudioContext,
     destination: AudioNode,
     track: AudioTrack,
-    isOffline = false
+    isOffline = false,
+    buses: { reverbIn: AudioNode; delayIn: AudioNode } | null = null
   ): TrackGraphNodes {
     const input = ctx.createGain();
 
@@ -635,6 +716,14 @@ export class StudioAudioEngine {
     hissLowpass.Q.value = 0.707;
 
     // Stage 2: Voice Softener & Auto-Pitch Formant Focus
+    const deEsserDyn: AudioNode = this.dspReady.has(ctx)
+      ? new AudioWorkletNode(ctx, 'aether-deesser', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+          channelCountMode: 'max',
+        })
+      : ctx.createGain();
     const deEsserFilter = ctx.createBiquadFilter();
     deEsserFilter.type = 'peaking';
     deEsserFilter.frequency.value = 4600;
@@ -727,6 +816,11 @@ export class StudioAudioEngine {
 
     const sumNode = ctx.createGain();
     const volumeNode = ctx.createGain();
+    const autoGain = ctx.createGain();
+    const sendReverb = ctx.createGain();
+    sendReverb.gain.value = track.sends?.reverb ?? 0;
+    const sendDelay = ctx.createGain();
+    sendDelay.gain.value = track.sends?.delay ?? 0;
     const pannerNode = ctx.createStereoPanner();
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
@@ -738,7 +832,8 @@ export class StudioAudioEngine {
     // Core serial chain
     input.connect(rumbleHighpass);
     rumbleHighpass.connect(hissLowpass);
-    hissLowpass.connect(deEsserFilter);
+    hissLowpass.connect(deEsserDyn);
+    deEsserDyn.connect(deEsserFilter);
     deEsserFilter.connect(harshCutFilter);
     harshCutFilter.connect(vocalWarmthFilter);
     vocalWarmthFilter.connect(autoPitchFormant);
@@ -777,7 +872,19 @@ export class StudioAudioEngine {
 
     // Output strip
     sumNode.connect(volumeNode);
-    volumeNode.connect(pannerNode);
+    volumeNode.connect(autoGain);
+    autoGain.connect(pannerNode);
+    if (buses) {
+      // Post-fader, post-pan sends (muting the track also mutes its sends)
+      if (!isOffline || (track.sends?.reverb ?? 0) > 0) {
+        pannerNode.connect(sendReverb);
+        sendReverb.connect(buses.reverbIn);
+      }
+      if (!isOffline || (track.sends?.delay ?? 0) > 0) {
+        pannerNode.connect(sendDelay);
+        sendDelay.connect(buses.delayIn);
+      }
+    }
     if (!isOffline) {
       pannerNode.connect(analyser);
       analyser.connect(destination);
@@ -790,6 +897,7 @@ export class StudioAudioEngine {
       rawDryGain,
       rumbleHighpass,
       hissLowpass,
+      deEsserDyn,
       deEsserFilter,
       harshCutFilter,
       vocalWarmthFilter,
@@ -817,13 +925,79 @@ export class StudioAudioEngine {
       reverbWet,
       sumNode,
       volumeNode,
+      autoGain,
+      sendReverb,
+      sendDelay,
       pannerNode,
       analyser,
       currentReverbDecay: track.effects.reverbDecay,
     };
 
     this.applyEffectsToNodes(ctx, nodes, track.effects);
+    if (isOffline) this.pruneSilentBranches(nodes, track.effects);
     return nodes;
+  }
+
+  /**
+   * Offline renders only: disconnect effect branches whose mix is zero. Their settings can't change
+   * during a render, and an idle convolver/delay/harmony branch otherwise costs as much CPU as an
+   * active one, which made exports several times slower than necessary.
+   */
+  private pruneSilentBranches(nodes: TrackGraphNodes, fx: TrackEffects): void {
+    const cut = (from: AudioNode, to: AudioNode) => {
+      try {
+        from.disconnect(to);
+      } catch {}
+    };
+    // Same formulas as applyEffectsToNodes (its gains are ramped, so .value isn't final yet)
+    const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+    const dryNorm = Math.max(0, Math.min(1.5, (fx.dryLevel ?? 100) / 100));
+    const wetNorm = Math.max(0, Math.min(1.5, (fx.wetLevel ?? 100) / 100));
+    const harmonyWet =
+      clamp01((fx.harmonyAmount ?? 0) / 100) * 0.85 +
+      clamp01((fx.voiceSoftener ?? 0) / 100) * 0.12 +
+      Math.max(0, wetNorm - 1) * 0.25;
+    const rawDry = dryNorm * (1 - Math.min(1, wetNorm));
+
+    if (fx.reverbMix <= 0 || wetNorm <= 0) cut(nodes.compressor, nodes.convolver);
+    if (fx.delayMix <= 0 || wetNorm <= 0) cut(nodes.compressor, nodes.delayNode);
+    if (harmonyWet <= 0 || wetNorm <= 0) {
+      cut(nodes.compressor, nodes.harmonyDelayL);
+      cut(nodes.compressor, nodes.harmonyDelayR);
+      try {
+        nodes.harmonyLfoL.stop();
+        nodes.harmonyLfoR.stop();
+      } catch {}
+    }
+    if (rawDry <= 0) cut(nodes.input, nodes.rawDryGain);
+
+    // Bypass serial stages left at neutral settings. Only zero-latency biquads are skipped, so
+    // every track stays sample-aligned. The drive stage (2x oversampling adds a small delay) and
+    // the compressor (lookahead) always stay: removing either on only some tracks would shift
+    // those tracks in time relative to the others.
+    const softRatio = clamp01((fx.voiceSoftener ?? 0) / 100);
+    const pitchRatio = clamp01((fx.autoPitchAmount ?? 0) / 100);
+    const nr = clamp01((fx.noiseRemoval ?? 0) / 100);
+    const hasDynDeEss = !!(nodes.deEsserDyn as AudioWorkletNode).parameters?.get('amount');
+    const highGain = fx.eqHighGain - (hasDynDeEss ? 0 : softRatio * 3) + pitchRatio * 2;
+    const stages: [AudioNode, boolean][] = [
+      [nodes.input, true],
+      [nodes.rumbleHighpass, nr > 0],
+      [nodes.hissLowpass, nr > 0],
+      [nodes.deEsserDyn, softRatio > 0],
+      [nodes.deEsserFilter, softRatio > 0],
+      [nodes.harshCutFilter, softRatio > 0],
+      [nodes.vocalWarmthFilter, softRatio > 0],
+      [nodes.autoPitchFormant, pitchRatio > 0],
+      [nodes.eqLow, Math.abs(fx.eqLowGain) > 0.01],
+      [nodes.eqMid, Math.abs(fx.eqMidGain) > 0.01],
+      [nodes.eqHigh, Math.abs(highGain) > 0.01],
+      [nodes.driveShaper, true],
+      [nodes.compressor, true],
+    ];
+    for (let i = 0; i < stages.length - 1; i++) cut(stages[i][0], stages[i + 1][0]);
+    const active = stages.filter(([, on]) => on).map(([n]) => n);
+    for (let i = 0; i < active.length - 1; i++) active[i].connect(active[i + 1]);
   }
 
   private applyEffectsToNodes(ctx: BaseAudioContext, nodes: TrackGraphNodes, fx: TrackEffects): void {
@@ -835,11 +1009,27 @@ export class StudioAudioEngine {
     const lpFreq = 20000 - Math.pow(nrRatio, 0.8) * 15400;
     nodes.rumbleHighpass.frequency.setTargetAtTime(hpFreq, now, 0.015);
     nodes.hissLowpass.frequency.setTargetAtTime(lpFreq, now, 0.015);
+    // At 0 % these must be true pass-throughs: a 20 kHz low-pass still dulls and phase-shifts
+    // the top octave at 44.1/48 kHz. A 0 dB peaking filter is an exact identity.
+    const hpType: BiquadFilterType = nrRatio > 0 ? 'highpass' : 'peaking';
+    const lpType: BiquadFilterType = nrRatio > 0 ? 'lowpass' : 'peaking';
+    if (nodes.rumbleHighpass.type !== hpType) nodes.rumbleHighpass.type = hpType;
+    if (nodes.hissLowpass.type !== lpType) nodes.hissLowpass.type = lpType;
 
     // Voice Softener
     const softRatio = Math.max(0, Math.min(1, (fx.voiceSoftener ?? 0) / 100));
-    nodes.deEsserFilter.gain.setTargetAtTime(-softRatio * 14.0, now, 0.015);
-    nodes.harshCutFilter.gain.setTargetAtTime(-softRatio * 6.0, now, 0.015);
+    // The dynamic de-esser handles "s" sounds only when they happen; the static cuts are now
+    // gentle (they used to dull the whole voice by up to 14 dB)
+    const deEssAmount = (nodes.deEsserDyn as AudioWorkletNode).parameters?.get('amount');
+    if (deEssAmount) {
+      deEssAmount.setTargetAtTime(softRatio, now, 0.015);
+      nodes.deEsserFilter.gain.setTargetAtTime(-softRatio * 3.0, now, 0.015);
+      nodes.harshCutFilter.gain.setTargetAtTime(-softRatio * 3.0, now, 0.015);
+    } else {
+      // No worklet support: fall back to the original static softening
+      nodes.deEsserFilter.gain.setTargetAtTime(-softRatio * 14.0, now, 0.015);
+      nodes.harshCutFilter.gain.setTargetAtTime(-softRatio * 6.0, now, 0.015);
+    }
     nodes.vocalWarmthFilter.gain.setTargetAtTime(softRatio * 5.5, now, 0.015);
 
     // Auto-Pitch Formant Presence & Sheen
@@ -851,7 +1041,8 @@ export class StudioAudioEngine {
     nodes.eqMid.frequency.setTargetAtTime(fx.eqMidFreq, now, 0.015);
     nodes.eqMid.Q.setTargetAtTime(fx.eqMidQ, now, 0.015);
     nodes.eqMid.gain.setTargetAtTime(fx.eqMidGain, now, 0.015);
-    nodes.eqHigh.gain.setTargetAtTime(fx.eqHighGain - softRatio * 3.0 + pitchRatio * 2.0, now, 0.015);
+    const softHighCut = deEssAmount ? 0 : softRatio * 3.0;
+    nodes.eqHigh.gain.setTargetAtTime(fx.eqHighGain - softHighCut + pitchRatio * 2.0, now, 0.015);
 
     nodes.driveShaper.curve = this.createDistortionCurve(fx.drive);
 
@@ -925,6 +1116,7 @@ export class StudioAudioEngine {
   }
 
   public syncTracks(tracks: AudioTrack[]): void {
+    this.lastSyncedTracks = tracks;
     const ctx = this.getContext();
     if (!this.masterGain) return;
 
@@ -941,7 +1133,7 @@ export class StudioAudioEngine {
     for (const track of tracks) {
       let nodes = this.trackNodes.get(track.id);
       if (!nodes) {
-        nodes = this.buildTrackChain(ctx, this.masterGain, track, false);
+        nodes = this.buildTrackChain(ctx, this.masterGain, track, false, this.returnBuses);
         this.trackNodes.set(track.id, nodes);
       }
 
@@ -950,6 +1142,18 @@ export class StudioAudioEngine {
 
       nodes.volumeNode.gain.setTargetAtTime(targetGain, ctx.currentTime, 0.015);
       nodes.pannerNode.pan.setTargetAtTime(track.pan, ctx.currentTime, 0.015);
+      nodes.sendReverb.gain.setTargetAtTime(track.sends?.reverb ?? 0, ctx.currentTime, 0.015);
+      nodes.sendDelay.gain.setTargetAtTime(track.sends?.delay ?? 0, ctx.currentTime, 0.015);
+      if (!this.isPlaying) {
+        // Stopped: hold the automation value at the playhead (monitoring, meters)
+        const at = this.transport?.fromTime ?? 0;
+        nodes.autoGain.gain.cancelScheduledValues(ctx.currentTime);
+        nodes.autoGain.gain.setTargetAtTime(
+          valueAt(track.automation?.volume, at),
+          ctx.currentTime,
+          0.01
+        );
+      }
       this.applyEffectsToNodes(ctx, nodes, track.effects);
     }
   }
@@ -994,6 +1198,13 @@ export class StudioAudioEngine {
     if (!t || !ctx) return;
     const MICRO_FADE = 0.004;
     const toCtx = (tl: number) => seg.ctxStart + (tl - seg.from);
+
+    for (const track of t.tracks) {
+      const nodes = this.trackNodes.get(track.id);
+      if (nodes) {
+        scheduleAutomation(nodes.autoGain.gain, track.automation?.volume, seg.from, seg.to, seg.ctxStart);
+      }
+    }
 
     for (const clip of t.clips) {
       const buffer = this.buffers.get(clip.bufferId);
@@ -1119,7 +1330,9 @@ export class StudioAudioEngine {
     loop?: { start: number; end: number } | null,
     options: { bpm?: number; startAtCtx?: number } = {}
   ): void {
-    this.stop();
+    // Restarting while playing (seek, loop change, live clip edit): short fade, no click
+    const restarting = this.isPlaying;
+    this.stop(restarting ? 0.012 : 0);
     if (options.bpm) this.currentBpm = options.bpm;
     const ctx = this.getContext();
     if (ctx.state === 'suspended') ctx.resume().catch(() => {});
@@ -1127,8 +1340,9 @@ export class StudioAudioEngine {
 
     const loopActive =
       loop && loop.end - loop.start > 0.1 && fromTime < loop.end ? { ...loop } : null;
-    // Small headroom so the first notes are never scheduled in the past
-    const startCtx = Math.max(options.startAtCtx ?? 0, ctx.currentTime + 0.03);
+    // Small headroom so the first notes are never scheduled in the past. On a live restart the
+    // new audio starts as the old one finishes fading, so there's no audible gap.
+    const startCtx = Math.max(options.startAtCtx ?? 0, ctx.currentTime + (restarting ? 0.012 : 0.03));
 
     this.transport = {
       tracks,
@@ -1149,15 +1363,36 @@ export class StudioAudioEngine {
     this.schedulerTimer = window.setInterval(this.schedulerTick, 25);
   }
 
-  public stop(): void {
+  /**
+   * Stops playback. `fadeSec` > 0 ramps sounding clips down first (used when playback is
+   * re-scheduled live, e.g. seek or loop change) so the cut doesn't click.
+   */
+  public stop(fadeSec = 0): void {
     if (this.schedulerTimer !== null) {
       window.clearInterval(this.schedulerTimer);
       this.schedulerTimer = null;
     }
+    const now = this.ctx?.currentTime ?? 0;
+    if (fadeSec > 0 && this.ctx) {
+      for (const list of this.activeClipNodes.values()) {
+        for (const { clipGainNode } of list) {
+          const g = clipGainNode.gain;
+          g.cancelScheduledValues(now);
+          g.setValueAtTime(g.value, now);
+          g.linearRampToValueAtTime(0, now + fadeSec);
+        }
+      }
+    }
     for (const src of this.activeSources) {
       try {
-        src.stop();
-        src.disconnect();
+        if (fadeSec > 0) {
+          src.stop(now + fadeSec + 0.005);
+          // disconnect once it has actually stopped
+          src.onended = () => src.disconnect();
+        } else {
+          src.stop();
+          src.disconnect();
+        }
       } catch {}
     }
     this.activeSources.clear();
@@ -1213,6 +1448,9 @@ export class StudioAudioEngine {
 
     const prevById = new Map(t.clips.map((c) => [c.id, c]));
     let needsReschedule = prevById.size !== clips.length;
+    // Automation edits during playback: re-schedule so the new curve is heard right away
+    const prevAuto = new Map(t.tracks.map((tr) => [tr.id, tr.automation?.volume]));
+    if (tracks.some((tr) => prevAuto.get(tr.id) !== tr.automation?.volume)) needsReschedule = true;
     if (!needsReschedule) {
       for (const clip of clips) {
         const prev = prevById.get(clip.id);
@@ -1595,6 +1833,38 @@ export class StudioAudioEngine {
     return buf;
   }
 
+  /**
+   * Loop recording: splits one continuous, timeline-aligned recording into takes of exactly
+   * `passSec` (one per loop pass). A final partial pass is kept (padded with silence) when it
+   * is at least `minPartialSec` long. Returns [] if less than one full pass was recorded.
+   */
+  public sliceIntoTakes(
+    bufferId: string,
+    passSec: number,
+    minPartialSec = 1
+  ): { bufferId: string; complete: boolean }[] {
+    const src = this.buffers.get(bufferId);
+    if (!src || passSec <= 0) return [];
+    const ctx = this.getContext();
+    const n = Math.round(passSec * src.sampleRate);
+    if (src.length < n) return [];
+    const out: { bufferId: string; complete: boolean }[] = [];
+    for (let k = 0; k * n < src.length; k++) {
+      const start = k * n;
+      const len = Math.min(n, src.length - start);
+      const complete = len === n;
+      if (!complete && len < minPartialSec * src.sampleRate) break;
+      const take = ctx.createBuffer(src.numberOfChannels, n, src.sampleRate);
+      for (let ch = 0; ch < src.numberOfChannels; ch++) {
+        take.copyToChannel(src.getChannelData(ch).subarray(start, start + len), ch);
+      }
+      const id = `${bufferId}_take${k + 1}`;
+      this.registerBuffer(id, take, true);
+      out.push({ bufferId: id, complete });
+    }
+    return out;
+  }
+
   /** Stops the microphone and discards the take (e.g. count-in cancelled). */
   public async cancelMicRecording(): Promise<void> {
     this.cancelCountIn();
@@ -1679,10 +1949,56 @@ export class StudioAudioEngine {
     tracks: AudioTrack[],
     clips: AudioClip[],
     masterVolume: number,
+    master: MasterSettings,
+    returns: FxReturns = this.returns,
+    bpm: number = this.currentBpm
+  ): Promise<{ buffer: AudioBuffer; report: LoudnessReport }> {
+    const raw = await this.renderMixdown(tracks, clips, masterVolume, master, returns, bpm);
+    try {
+      return await this.masterInWorker(raw, master);
+    } catch {
+      return masterBuffer(raw, master); // worker unavailable: block briefly instead of failing
+    }
+  }
+
+  /** Runs loudness normalization + limiting in a one-shot worker so the UI stays responsive. */
+  private masterInWorker(
+    raw: AudioBuffer,
     master: MasterSettings
   ): Promise<{ buffer: AudioBuffer; report: LoudnessReport }> {
-    const raw = await this.renderMixdown(tracks, clips, masterVolume, master);
-    return masterBuffer(raw, master);
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL('./dsp/masterWorker.ts', import.meta.url), {
+        type: 'module',
+      });
+      const done = (fn: () => void) => {
+        worker.terminate();
+        fn();
+      };
+      worker.onerror = (err) => done(() => reject(err));
+      worker.onmessage = (e: MessageEvent) => {
+        const msg = e.data as { channels?: Float32Array[]; report?: LoudnessReport; error?: string };
+        if (!msg.channels || !msg.report) {
+          done(() => reject(new Error(msg.error || 'Mastering failed')));
+          return;
+        }
+        const out = new AudioBuffer({
+          length: raw.length,
+          numberOfChannels: msg.channels.length,
+          sampleRate: raw.sampleRate,
+        });
+        msg.channels.forEach((d, c) => out.copyToChannel(d, c));
+        const report = msg.report;
+        done(() => resolve({ buffer: out, report }));
+      };
+      const channels: Float32Array[] = [];
+      for (let c = 0; c < raw.numberOfChannels; c++) {
+        channels.push(new Float32Array(raw.getChannelData(c)));
+      }
+      worker.postMessage(
+        { id: 1, channels, sampleRate: raw.sampleRate, settings: master },
+        channels.map((c) => c.buffer as ArrayBuffer)
+      );
+    });
   }
 
   /** Renders the whole project offline and returns the mixed stereo AudioBuffer. */
@@ -1690,7 +2006,9 @@ export class StudioAudioEngine {
     tracks: AudioTrack[],
     clips: AudioClip[],
     masterVolume: number,
-    master?: MasterSettings
+    master?: MasterSettings,
+    returns: FxReturns = this.returns,
+    bpm: number = this.currentBpm
   ): Promise<AudioBuffer> {
     const maxEnd =
       clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 4.0) + 1.5;
@@ -1711,12 +2029,24 @@ export class StudioAudioEngine {
 
     const anySolo = tracks.some((t) => t.solo);
     const offlineTrackNodes = new Map<string, TrackGraphNodes>();
+    if (tracks.some((t) => (t.effects.voiceSoftener ?? 0) > 0)) {
+      await this.ensureDspModule(offlineCtx);
+    }
+
+    // FX returns only when some track actually sends to them
+    const usesReturns = tracks.some((t) => (t.sends?.reverb ?? 0) > 0 || (t.sends?.delay ?? 0) > 0);
+    let buses: ReturnBuses | null = null;
+    if (usesReturns) {
+      buses = createReturnBuses(offlineCtx, returns, bpm);
+      buses.output.connect(masterOut);
+    }
 
     for (const track of tracks) {
-      const nodes = this.buildTrackChain(offlineCtx, masterOut, track, true);
+      const nodes = this.buildTrackChain(offlineCtx, masterOut, track, true, buses);
       const isAudible = anySolo ? track.solo : !track.muted;
       nodes.volumeNode.gain.value = isAudible ? track.volume : 0;
       nodes.pannerNode.pan.value = track.pan;
+      scheduleAutomation(nodes.autoGain.gain, track.automation?.volume, 0, Infinity, 0);
       offlineTrackNodes.set(track.id, nodes);
     }
 

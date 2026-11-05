@@ -1,7 +1,8 @@
 import React from 'react';
-import { Trash2 } from 'lucide-react';
+import { Spline, Trash2 } from 'lucide-react';
 import { AudioClip, AudioTrack, LoopRegion } from '../types/audio';
 import { TimelineClipItem } from './TimelineClipItem';
+import { AutomationLane } from './AutomationLane';
 import { RangeInput } from './ParamSlider';
 import { meterStore, playheadStore, useLiveStore } from '../utils/liveStore';
 
@@ -29,6 +30,72 @@ const RecordingBlock: React.FC<{ startTime: number; pps: number }> = ({ startTim
   );
 };
 
+/** Draggable loop region in the ruler: drag the body to move it, the edges to resize it. */
+const LoopRegionBar: React.FC<{
+  loop: LoopRegion;
+  pps: number;
+  /** Snap step in seconds (0 = no snapping) */
+  snapSec: number;
+  onChange?: (loop: LoopRegion) => void;
+}> = ({ loop, pps, snapSec, onChange }) => {
+  const snap = (t: number) => (snapSec > 0 ? Math.round(t / snapSec) * snapSec : t);
+  const minLen = snapSec > 0 ? snapSec : 0.25;
+
+  const drag = (e: React.PointerEvent, mode: 'move' | 'start' | 'end') => {
+    if (!onChange) return;
+    e.stopPropagation(); // don't seek
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const x0 = e.clientX;
+    const { start: s0, end: e0 } = loop;
+    const onMove = (pe: PointerEvent) => {
+      const dt = (pe.clientX - x0) / pps;
+      if (mode === 'move') {
+        const start = Math.max(0, snap(s0 + dt));
+        onChange({ ...loop, start, end: start + (e0 - s0) });
+      } else if (mode === 'start') {
+        onChange({ ...loop, start: Math.max(0, Math.min(e0 - minLen, snap(s0 + dt))) });
+      } else {
+        onChange({ ...loop, end: Math.max(s0 + minLen, snap(e0 + dt)) });
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  return (
+    <div
+      style={{ left: loop.start * pps, width: Math.max(0, (loop.end - loop.start) * pps) }}
+      className="absolute top-0 bottom-0 z-10"
+    >
+      <div
+        onPointerDown={(e) => drag(e, 'move')}
+        title="Drag to move the loop"
+        className={`absolute inset-x-0 top-0 h-2.5 bg-accent/70 rounded-b-sm ${onChange ? 'cursor-grab active:cursor-grabbing' : ''}`}
+      />
+      <div className="absolute inset-0 bg-accent/12 border-x border-accent/70 pointer-events-none" />
+      {onChange && (
+        <>
+          <div
+            onPointerDown={(e) => drag(e, 'start')}
+            title="Drag to set loop start"
+            className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize"
+          />
+          <div
+            onPointerDown={(e) => drag(e, 'end')}
+            title="Drag to set loop end"
+            className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize"
+          />
+        </>
+      )}
+    </div>
+  );
+};
+
 /** Per-track level hairline (re-renders only when its own rounded level changes). */
 export const TrackLevelBar: React.FC<{ trackId: string; color: string; className?: string }> = ({
   trackId,
@@ -48,7 +115,8 @@ interface ArrangementProps {
   tracks: AudioTrack[];
   clips: AudioClip[];
   selectedTrackId: string;
-  selectedClipId: string;
+  /** All selected clips (multi-selection) */
+  selectedClipIds: string[];
   loop: LoopRegion;
   bpm: number;
   pixelsPerSecond: number;
@@ -57,11 +125,18 @@ interface ArrangementProps {
   compact?: boolean;
   cornerSlot: React.ReactNode;
   onSelectTrack: (trackId: string) => void;
-  onSelectClip: (clipId: string, trackId: string) => void;
-  onUpdateTrack: (trackId: string, patch: Partial<AudioTrack>) => void;
+  onSelectClip: (clipId: string, trackId: string, mode?: 'toggle' | 'press' | 'click') => void;
+  /** `undoKey` groups edits into one undo step (e.g. one automation gesture) */
+  onUpdateTrack: (trackId: string, patch: Partial<AudioTrack>, undoKey?: string) => void;
   onUpdateClip: (clipId: string, patch: Partial<AudioClip>, commitHistory?: boolean) => void;
+  /** A clip move/trim gesture ended (resolve overlaps) */
+  onClipDragEnd?: (clipId: string) => void;
+  /** Body drag of a clip by `dtSec` seconds (moves the whole selection) */
+  onClipDragMove?: (clipId: string, dtSec: number) => void;
   onDeleteTrack: (trackId: string) => void;
   onSeek: (time: number) => void;
+  /** Move/resize the loop region (drag in the ruler). Double-click a bar to loop it. */
+  onLoopChange?: (loop: LoopRegion) => void;
   /** Active take being recorded; drawn as a live block on its lane. */
   recording?: { trackId: string; startTime: number } | null;
 }
@@ -70,7 +145,7 @@ export const Arrangement: React.FC<ArrangementProps> = ({
   tracks,
   clips,
   selectedTrackId,
-  selectedClipId,
+  selectedClipIds,
   loop,
   bpm,
   pixelsPerSecond: pps,
@@ -82,8 +157,11 @@ export const Arrangement: React.FC<ArrangementProps> = ({
   onSelectClip,
   onUpdateTrack,
   onUpdateClip,
+  onClipDragEnd,
+  onClipDragMove,
   onDeleteTrack,
   onSeek,
+  onLoopChange,
   recording = null,
 }) => {
   const headerW = compact ? 152 : 236;
@@ -128,16 +206,24 @@ export const Arrangement: React.FC<ArrangementProps> = ({
           </div>
           <div
             onPointerDown={handleRulerPointerDown}
+            onDoubleClick={(e) => {
+              if (!onLoopChange) return;
+              // Double-click a bar to loop it
+              const left = e.currentTarget.getBoundingClientRect().left;
+              const t = Math.max(0, (e.clientX - left) / pps);
+              const start = Math.floor(t / barSec) * barSec;
+              onLoopChange({ enabled: true, start, end: start + barSec });
+            }}
+            title="Click to move the playhead · double-click a bar to loop it"
             style={{ width: widthPx }}
             className="relative bg-panel border-b border-line touch-none cursor-pointer"
           >
             {loop.enabled && (
-              <div
-                style={{
-                  left: loop.start * pps,
-                  width: Math.max(0, (loop.end - loop.start) * pps),
-                }}
-                className="absolute inset-y-0 bg-accent/15 border-x border-accent/60 pointer-events-none"
+              <LoopRegionBar
+                loop={loop}
+                pps={pps}
+                snapSec={snapToGrid ? beatSec : 0}
+                onChange={onLoopChange}
               />
             )}
             {Array.from({ length: bars + 1 }).map((_, bar) => (
@@ -158,8 +244,8 @@ export const Arrangement: React.FC<ArrangementProps> = ({
           {tracks.map((track) => {
             const isSelected = track.id === selectedTrackId;
             return (
+              <React.Fragment key={track.id}>
               <div
-                key={track.id}
                 style={{ height: rowH }}
                 className={`flex border-b border-line ${
                   isSelected
@@ -238,6 +324,24 @@ export const Arrangement: React.FC<ArrangementProps> = ({
                     >
                       S
                     </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onUpdateTrack(track.id, { showAutomation: !track.showAutomation });
+                      }}
+                      title="Show volume automation"
+                      aria-label="Show volume automation"
+                      aria-pressed={!!track.showAutomation}
+                      className={`${compact ? 'w-6 h-6' : 'w-7 h-7'} rounded-md transition-colors flex items-center justify-center shrink-0 ${
+                        track.showAutomation
+                          ? 'bg-accent/20 text-accent'
+                          : (track.automation?.volume?.length ?? 0) > 0
+                          ? 'bg-app text-accent/80 hover:text-accent'
+                          : 'bg-app text-mute hover:text-ink'
+                      }`}
+                    >
+                      <Spline className="w-3.5 h-3.5" />
+                    </button>
                     <RangeInput
                       value={track.volume}
                       min={0}
@@ -263,12 +367,17 @@ export const Arrangement: React.FC<ArrangementProps> = ({
                 >
                   {clips
                     .filter((c) => c.trackId === track.id)
-                    .map((clip) => (
+                    .sort((a, b) => a.startTime - b.startTime)
+                    .map((clip, i, lane) => (
                       <TimelineClipItem
                         key={clip.id}
                         clip={clip}
+                        prevEnd={i > 0 ? lane[i - 1].startTime + lane[i - 1].duration : 0}
+                        nextStart={i < lane.length - 1 ? lane[i + 1].startTime : Infinity}
+                        onDragEnd={onClipDragEnd}
                         pixelsPerSecond={pps}
-                        isSelected={clip.id === selectedClipId}
+                        isSelected={selectedClipIds.includes(clip.id)}
+                        onDragMove={onClipDragMove}
                         snapToGrid={snapToGrid}
                         bpm={bpm}
                         onSelectClip={onSelectClip}
@@ -280,6 +389,19 @@ export const Arrangement: React.FC<ArrangementProps> = ({
                   )}
                 </div>
               </div>
+              {track.showAutomation && (
+                <AutomationLane
+                  track={track}
+                  headerW={headerW}
+                  widthPx={widthPx}
+                  pps={pps}
+                  snapSec={snapToGrid ? beatSec / 4 : 0}
+                  onChange={(points, gesture) =>
+                    onUpdateTrack(track.id, { automation: { ...track.automation, volume: points } }, gesture)
+                  }
+                />
+              )}
+              </React.Fragment>
             );
           })}
 

@@ -376,15 +376,56 @@ export function limitInPlace(
 
 /* ------------------------------- full mastering ----------------------------- */
 
-function copyChannels(buffer: AudioBuffer, gain: number): Float32Array[] {
-  const out: Float32Array[] = [];
-  for (let c = 0; c < buffer.numberOfChannels; c++) {
-    const src = buffer.getChannelData(c);
+function scaleChannels(channels: Float32Array[], gain: number): Float32Array[] {
+  return channels.map((src) => {
     const dst = new Float32Array(src.length);
     for (let i = 0; i < src.length; i++) dst[i] = src[i] * gain;
-    out.push(dst);
+    return dst;
+  });
+}
+
+/**
+ * Pure, DOM-free core of `masterBuffer`: loudness-normalizes and true-peak-limits raw channels.
+ * Runs inside the mastering Web Worker so long songs don't freeze the UI.
+ */
+export function masterChannels(
+  channels: Float32Array[],
+  sampleRate: number,
+  settings: MasterSettings
+): { channels: Float32Array[]; report: LoudnessReport } {
+  const inputLufs = measureIntegratedLufs(channels, sampleRate);
+  if (settings.preset === 'off' || !Number.isFinite(inputLufs)) {
+    return {
+      channels,
+      report: {
+        inputLufs,
+        outputLufs: inputLufs,
+        truePeakDb: measureTruePeakDb(channels),
+        gainDb: 0,
+      },
+    };
   }
-  return out;
+
+  const clampGain = (db: number) => Math.max(-24, Math.min(24, db));
+  let gainDb = clampGain(settings.targetLufs - inputLufs);
+  let chans: Float32Array[] = channels;
+  let outLufs = inputLufs;
+
+  for (let iter = 0; iter < 3; iter++) {
+    chans = scaleChannels(channels, dbToLin(gainDb));
+    limitInPlace(chans, sampleRate, settings.ceilingDb);
+    outLufs = measureIntegratedLufs(chans, sampleRate);
+    const diff = settings.targetLufs - outLufs;
+    if (!Number.isFinite(diff) || Math.abs(diff) < 0.3) break;
+    const next = clampGain(gainDb + diff);
+    if (Math.abs(next - gainDb) < 0.05) break; // gain clamp reached
+    gainDb = next;
+  }
+
+  return {
+    channels: chans,
+    report: { inputLufs, outputLufs: outLufs, truePeakDb: measureTruePeakDb(chans), gainDb },
+  };
 }
 
 /** Measures a buffer without changing it. */
@@ -405,44 +446,16 @@ export function masterBuffer(
   buffer: AudioBuffer,
   settings: MasterSettings
 ): { buffer: AudioBuffer; report: LoudnessReport } {
-  const before = analyzeBuffer(buffer);
-  if (settings.preset === 'off' || !Number.isFinite(before.lufs)) {
-    return {
-      buffer,
-      report: { inputLufs: before.lufs, outputLufs: before.lufs, truePeakDb: before.truePeakDb, gainDb: 0 },
-    };
-  }
-
-  const clampGain = (db: number) => Math.max(-24, Math.min(24, db));
-  let gainDb = clampGain(settings.targetLufs - before.lufs);
-  let chans: Float32Array[] = [];
-  let outLufs = before.lufs;
-
-  for (let iter = 0; iter < 3; iter++) {
-    chans = copyChannels(buffer, dbToLin(gainDb));
-    limitInPlace(chans, buffer.sampleRate, settings.ceilingDb);
-    outLufs = measureIntegratedLufs(chans, buffer.sampleRate);
-    const diff = settings.targetLufs - outLufs;
-    if (!Number.isFinite(diff) || Math.abs(diff) < 0.3) break;
-    const next = clampGain(gainDb + diff);
-    if (Math.abs(next - gainDb) < 0.05) break; // gain clamp reached
-    gainDb = next;
-  }
+  const chans: Float32Array[] = [];
+  for (let c = 0; c < buffer.numberOfChannels; c++) chans.push(buffer.getChannelData(c));
+  const res = masterChannels(chans, buffer.sampleRate, settings);
+  if (res.channels === chans) return { buffer, report: res.report };
 
   const out = new AudioBuffer({
     length: buffer.length,
     numberOfChannels: buffer.numberOfChannels,
     sampleRate: buffer.sampleRate,
   });
-  chans.forEach((d, c) => out.copyToChannel(d, c));
-
-  return {
-    buffer: out,
-    report: {
-      inputLufs: before.lufs,
-      outputLufs: outLufs,
-      truePeakDb: measureTruePeakDb(chans),
-      gainDb,
-    },
-  };
+  res.channels.forEach((d, c) => out.copyToChannel(d, c));
+  return { buffer: out, report: res.report };
 }

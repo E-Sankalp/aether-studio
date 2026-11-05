@@ -1,10 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
-  ArrowRight,
   Bell,
   Check,
   Headphones,
+  Keyboard,
   Home as HomeIcon,
   Layers,
   Magnet,
@@ -106,6 +106,46 @@ const Group: React.FC<{ children: React.ReactNode; className?: string }> = ({
 const Divider: React.FC<{ className?: string }> = ({ className = '' }) => (
   <span className={`w-px h-6 bg-white/[0.08] shrink-0 ${className}`} />
 );
+
+/**
+ * Tempo field that lets the user type freely ("9" on the way to "90" is not clamped to 60);
+ * the value is validated and applied on Enter/blur, and arrow keys nudge it live.
+ */
+const BpmInput: React.FC<{ bpm: number; onBpmChange: (bpm: number) => void }> = ({
+  bpm,
+  onBpmChange,
+}) => {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft !== null) {
+      const n = Number(draft);
+      onBpmChange(Number.isFinite(n) && n > 0 ? Math.max(60, Math.min(200, Math.round(n))) : bpm);
+      setDraft(null);
+    }
+  };
+  return (
+    <label className="flex items-baseline gap-1.5 pl-3 pr-3.5 cursor-text" title="Tempo (BPM)">
+      <input
+        type="text"
+        inputMode="numeric"
+        value={draft ?? String(bpm)}
+        onChange={(e) => setDraft(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+          else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            setDraft(null);
+            onBpmChange(Math.max(60, Math.min(200, bpm + (e.key === 'ArrowUp' ? 1 : -1))));
+          }
+        }}
+        aria-label="Tempo in BPM"
+        className="w-[3.2ch] bg-transparent font-mono text-[15px] font-medium text-ink outline-none tabular-nums text-right"
+      />
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-mute">BPM</span>
+    </label>
+  );
+};
 
 /* ------------------------------ shared pieces ------------------------------ */
 
@@ -279,6 +319,7 @@ export interface StudioHeaderProps extends TransportProps {
   onZoomOut: () => void;
   isExporting: boolean;
   onExport: (format: ExportFormatId) => void;
+  onShowShortcuts: () => void;
 }
 
 /** Home / Studio segmented switch. */
@@ -311,24 +352,6 @@ const ViewSwitch: React.FC<{
   </Group>
 );
 
-/** "Continue · <project>" chip shown on Home when a session is open. */
-const ContinueButton: React.FC<{ name: string; onClick: () => void; className?: string }> = ({
-  name,
-  onClick,
-  className = '',
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    title={`Back to "${name}"`}
-    className={`min-w-0 h-9 pl-3 pr-2.5 rounded-lg bg-black/25 border border-white/[0.06] hover:border-accent/50 flex items-center gap-2 text-[13px] transition-colors ${className}`}
-  >
-    <span className="text-mute shrink-0">Continue</span>
-    <span className="font-semibold text-ink truncate">{name}</span>
-    <ArrowRight className="w-4 h-4 text-accent shrink-0" />
-  </button>
-);
-
 /**
  * Home view header: no project controls (there may be no project at all). Shows the brand, the
  * view switch and, when a session is open, a way back to it.
@@ -339,13 +362,7 @@ const HomeHeader: React.FC<StudioHeaderProps> = (p) => (
     <Divider className="mx-1" />
     <ViewSwitch view={p.view} onViewChange={p.onViewChange} labelsAt="inline" />
     <div className="flex-1" />
-    {p.hasSession && p.view === 'home' && (
-      <ContinueButton
-        name={p.projectName || 'Untitled project'}
-        onClick={() => p.onViewChange('studio')}
-        className="max-w-[320px]"
-      />
-    )}
+    {/* Home shows a full "Continue" card, so no chip here; studio without a project: nothing */}
   </header>
 );
 
@@ -402,31 +419,22 @@ export const StudioHeader: React.FC<StudioHeaderProps> = (p) =>
       <div className="flex items-center h-[42px] rounded-[11px] bg-black/40 border border-white/[0.06] shadow-inner shadow-black/40 shrink-0">
         <Timecode className="px-3.5 font-mono text-[15px] font-medium tabular-nums brand-text w-[106px] text-center" />
         <Divider />
-        <label className="flex items-baseline gap-1.5 pl-3 pr-3.5 cursor-text" title="Tempo (BPM)">
-          <input
-            type="number"
-            min={60}
-            max={200}
-            value={p.bpm}
-            onChange={(e) => p.onBpmChange(Math.max(60, Math.min(200, Number(e.target.value) || 120)))}
-            aria-label="Tempo in BPM"
-            className="no-spinner w-[3.2ch] bg-transparent font-mono text-[15px] font-medium text-ink outline-none tabular-nums text-right"
-          />
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-mute">BPM</span>
-        </label>
+        <BpmInput bpm={p.bpm} onBpmChange={p.onBpmChange} />
       </div>
     </div>
 
     {/* Right: output */}
     {/* Not a size container: it sits in an auto-width grid column, which a container would collapse */}
     <div className="studio-header__right flex items-center justify-end gap-2 pl-2 pr-4 h-14">
-      <div className="hidden min-[1100px]:block">
+      {/* Meter: two-row layout from 1100 px; in the single-row layout (1440+) only from 1600 px */}
+      <div className="hidden min-[1100px]:block min-[1440px]:hidden min-[1600px]:block">
         <VisualizerDock isPlaying={p.isPlaying} />
       </div>
       <Group>
         <IconButton icon={Magnet} label="Snap to grid" active={p.snapToGrid} onClick={p.onToggleSnap} />
         <IconButton icon={ZoomOut} label="Zoom out" onClick={p.onZoomOut} />
         <IconButton icon={ZoomIn} label="Zoom in" onClick={p.onZoomIn} />
+        <IconButton icon={Keyboard} label="Keyboard shortcuts (?)" onClick={p.onShowShortcuts} />
       </Group>
       <ExportMenu isExporting={p.isExporting} onExport={p.onExport} />
     </div>
@@ -458,13 +466,6 @@ export const MobileHeader: React.FC<
     <header className="app-header shrink-0 relative z-40 h-[52px] px-3 flex items-center gap-2">
       <AetherLogo size={30} showCaption={false} />
       <div className="flex-1" />
-      {p.hasSession && (
-        <ContinueButton
-          name={p.projectName || 'Untitled project'}
-          onClick={p.onContinue}
-          className="max-w-[60%]"
-        />
-      )}
     </header>
   ) : (
   <header className="app-header @container shrink-0 relative z-40 h-[52px] px-3 flex items-center gap-2">

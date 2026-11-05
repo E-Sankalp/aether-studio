@@ -9,7 +9,7 @@
   --color-mute: #8d8d96;
   --color-accent: #f12c4c;
   --color-accent2: #ff6b3d;
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-sans: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 
@@ -91,9 +91,8 @@
 }
 
 .app-header {
-  background-image: linear-gradient(180deg, rgba(32, 32, 36, 0.92), rgba(22, 22, 24, 0.92));
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
+  /* Opaque: a backdrop blur here cost a full repaint of the region behind it every frame */
+  background-image: linear-gradient(180deg, #202024, #161618);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 0 1px rgba(0, 0, 0, 0.4),
     0 10px 28px -14px rgba(241, 44, 76, 0.28);
 }
@@ -134,8 +133,9 @@
     border-top: 0;
     background: transparent;
   }
+  /* The right zone must NOT clip: the Export dropdown opens below it */
   .studio-header__right {
-    overflow: hidden;
+    min-width: 0;
   }
 }
 
@@ -201,4 +201,84 @@ input[type="range"].param-slider::-moz-range-thumb {
   border-radius: 50%;
   background: #ffffff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+/* Toast entrance */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.toast-in {
+  animation: toast-in 160ms ease-out;
+}
+
+/* Visible keyboard focus everywhere (mouse clicks stay clean) */
+:focus-visible {
+  outline: 2px solid rgba(241, 44, 76, 0.75);
+  outline-offset: 2px;
+}
+input:focus-visible {
+  outline: none;
+}
+
+/* Off-screen panels are skipped by layout/paint until scrolled into view (faster tab switches) */
+.cv-auto {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+
+/* ------------------------------- Home hero -------------------------------- */
+/* All motion is transform/opacity only (GPU-composited: no layout or repaint per frame). */
+.hero-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.9) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.9) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 70% 80% at 30% 40%, #000 30%, transparent 75%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 80% at 30% 40%, #000 30%, transparent 75%);
+}
+@keyframes hero-drift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(40px, 24px, 0) scale(1.08); }
+}
+.hero-glow {
+  animation: hero-drift 14s ease-in-out infinite;
+  will-change: transform;
+}
+.hero-glow-2 {
+  animation: hero-drift 18s ease-in-out infinite reverse;
+  will-change: transform;
+}
+@keyframes hero-playhead {
+  from { transform: translateX(0%); }
+  to { transform: translateX(100%); }
+}
+.hero-playhead {
+  animation: hero-playhead 6s linear infinite;
+  will-change: transform;
+}
+@keyframes hero-eq {
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
+}
+.hero-eq > span {
+  transform-origin: bottom;
+  animation: hero-eq 1.1s ease-in-out infinite;
+  will-change: transform;
+}
+@keyframes hero-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+.hero-in {
+  animation: hero-in 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-glow,
+  .hero-glow-2,
+  .hero-playhead,
+  .hero-eq > span,
+  .hero-in {
+    animation: none;
+  }
 }

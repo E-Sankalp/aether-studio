@@ -1,4 +1,4 @@
-import { AudioClip, AudioTrack, LoopRegion, MasterSettings } from '../types/audio';
+import { AudioClip, AudioTrack, FxReturns, LoopRegion, MasterSettings } from '../types/audio';
 import { DEFAULT_EFFECTS } from '../audio/synthStems';
 
 const STORAGE_KEY = 'aether_studio_project_v1';
@@ -35,6 +35,8 @@ export interface PersistedProjectState {
   masterVolume: number;
   /** Mastering settings (missing in projects saved before mastering existed) */
   master?: MasterSettings;
+  /** Shared reverb/delay return settings (missing in older projects) */
+  returns?: FxReturns;
   selectedTrackId: string;
   selectedClipId: string;
   updatedAt: number;
@@ -451,6 +453,9 @@ export function exportProjectBundleFile(
     if (clip.bufferId && !builtinIds.has(clip.bufferId)) {
       neededIds.add(clip.bufferId);
     }
+    for (const take of clip.takes ?? []) {
+      if (!builtinIds.has(take.bufferId)) neededIds.add(take.bufferId);
+    }
     if (clip.sourceBufferId && !builtinIds.has(clip.sourceBufferId)) {
       neededIds.add(clip.sourceBufferId);
     }
@@ -525,6 +530,7 @@ export function collectReferencedBufferIds(
     for (const c of clips) {
       if (c.bufferId) ids.add(c.bufferId);
       if (c.sourceBufferId) ids.add(c.sourceBufferId);
+      for (const take of c.takes ?? []) ids.add(take.bufferId);
     }
   };
   projects.forEach((p) => add(p.clips || []));

@@ -1,0 +1,240 @@
+{
+  "results": [
+    {
+      "name": "first launch opens Home with no project",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "home offers the demo when no project is open",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "demo template loads tracks & clips",
+      "ok": true,
+      "detail": "4 clips, name \"Demo Song\""
+    },
+    {
+      "name": "playback advances",
+      "ok": true,
+      "detail": "t=0.95s after 1.5 s"
+    },
+    {
+      "name": "loop wraps back inside 0–8 s and keeps playing",
+      "ok": true,
+      "detail": "t=6.80s after 9.5 s"
+    },
+    {
+      "name": "Space stops playback",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "double-click ruler bar loops it",
+      "ok": true,
+      "detail": "{\"left\":176,\"width\":176}"
+    },
+    {
+      "name": "dragging the loop end resizes it",
+      "ok": true,
+      "detail": "width 352px"
+    },
+    {
+      "name": "S splits the selected clip at the playhead",
+      "ok": true,
+      "detail": "4 → 5"
+    },
+    {
+      "name": "Ctrl+Z undoes the split",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Ctrl+Shift+Z redoes it",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Ctrl+D duplicates",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Delete removes the selected clip",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "clip drag moves the clip",
+      "ok": true,
+      "detail": "264 → 385"
+    },
+    {
+      "name": "one Ctrl+Z restores the whole drag",
+      "ok": true,
+      "detail": "undo → 264"
+    },
+    {
+      "name": "BPM can be typed (95)",
+      "ok": true,
+      "detail": "value 95"
+    },
+    {
+      "name": "? opens the shortcuts list and Esc closes it",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "meter reads -∞ when nothing plays (no DC offset)",
+      "ok": true,
+      "detail": "-∞LUFS -∞ LUFS"
+    },
+    {
+      "name": "process slider commits on release and renders",
+      "ok": true,
+      "detail": "spinner seen: false, badge: true"
+    },
+    {
+      "name": "process change is undoable",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "analysis reaches the -14 LUFS streaming target",
+      "ok": true,
+      "detail": "-14.0 LUFS"
+    },
+    {
+      "name": "WAV export produces a valid 16-bit stereo file",
+      "ok": true,
+      "detail": "Demo_Song_95BPM.wav, 9.5 s"
+    },
+    {
+      "name": "export shows a success toast",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Shift+click selects multiple clips",
+      "ok": true,
+      "detail": "2 selected"
+    },
+    {
+      "name": "dragging moves the whole selection together",
+      "ok": true,
+      "detail": "a +83px, b +83px"
+    },
+    {
+      "name": "no clips overlap after the drop",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "one undo restores the group move",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Ctrl+C / Ctrl+V pastes the selection",
+      "ok": true,
+      "detail": "5 → 7"
+    },
+    {
+      "name": "pasted clips are placed without overlaps",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "undo removes the paste",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "dropping a clip onto another resolves the overlap",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "automation lane opens under the track",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "clicking the lane adds automation points",
+      "ok": true,
+      "detail": "2 points"
+    },
+    {
+      "name": "dragging a point changes its value",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "undo reverts just the last automation gesture",
+      "ok": true,
+      "detail": "2 points, point back at 232 (was 232)"
+    },
+    {
+      "name": "Mixer shows the shared FX returns",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "a track reverb send can be set",
+      "ok": true,
+      "detail": "Reverb send50%"
+    },
+    {
+      "name": "delay syncs to tempo (1/4 note at 95 BPM = 632 ms)",
+      "ok": true,
+      "detail": "632 ms"
+    },
+    {
+      "name": "count-in shows before recording",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "recording creates a take clip",
+      "ok": true,
+      "detail": "5 → 6"
+    },
+    {
+      "name": "a recorded take never overlaps existing clips",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "loop recording creates one take per pass",
+      "ok": true,
+      "detail": "[\"Take 1\",\"Take 2\",\"Take 3*\"]"
+    },
+    {
+      "name": "takes go to a new lane when the loop region is occupied",
+      "ok": true,
+      "detail": "5 → 6 tracks"
+    },
+    {
+      "name": "choosing another take switches the clip",
+      "ok": true,
+      "detail": "active take index 0"
+    },
+    {
+      "name": "shortcuts do nothing on Home",
+      "ok": true,
+      "detail": "0/7, playing false"
+    },
+    {
+      "name": "project survives reload",
+      "ok": true,
+      "detail": "\"Demo Song\" 7 clips → \"Demo Song\" 7 clips after 3.9 s"
+    },
+    {
+      "name": "mobile layout fits without horizontal overflow",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "pageErrors": []
+}

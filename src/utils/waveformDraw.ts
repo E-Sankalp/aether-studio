@@ -1,3 +1,35 @@
+/**
+ * Per-buffer min/max peaks in blocks of PEAK_BLOCK samples (mono mix), computed once and cached.
+ * Drawing then reads ~width peaks instead of scanning the audio, and never misses a transient.
+ */
+const PEAK_BLOCK = 256;
+const peakCache = new WeakMap<AudioBuffer, { min: Float32Array; max: Float32Array }>();
+
+function peaksOf(buffer: AudioBuffer) {
+  let p = peakCache.get(buffer);
+  if (p) return p;
+  const c0 = buffer.getChannelData(0);
+  const c1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : c0;
+  const blocks = Math.ceil(buffer.length / PEAK_BLOCK);
+  const min = new Float32Array(blocks);
+  const max = new Float32Array(blocks);
+  for (let b = 0; b < blocks; b++) {
+    let lo = 0;
+    let hi = 0;
+    const end = Math.min(buffer.length, (b + 1) * PEAK_BLOCK);
+    for (let i = b * PEAK_BLOCK; i < end; i++) {
+      const v = (c0[i] + c1[i]) * 0.5;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    min[b] = lo;
+    max[b] = hi;
+  }
+  p = { min, max };
+  peakCache.set(buffer, p);
+  return p;
+}
+
 export function drawBufferWaveform(
   canvas: HTMLCanvasElement,
   buffer: AudioBuffer,
@@ -52,13 +84,22 @@ export function drawBufferWaveform(
 
     let min = 0;
     let max = 0;
-    const step = Math.max(1, Math.floor(samplesPerPixel / 16));
     const end = Math.min(buffer.length, sampleStart + samplesPerPixel);
-
-    for (let s = sampleStart; s < end; s += step) {
-      const val = (chan0[s] + chan1[s]) * 0.5;
-      if (val < min) min = val;
-      if (val > max) max = val;
+    if (samplesPerPixel >= PEAK_BLOCK * 2) {
+      // Zoomed out: use the cached block peaks
+      const peaks = peaksOf(buffer);
+      const b1 = Math.min(peaks.min.length, Math.ceil(end / PEAK_BLOCK));
+      for (let b = Math.floor(sampleStart / PEAK_BLOCK); b < b1; b++) {
+        if (peaks.min[b] < min) min = peaks.min[b];
+        if (peaks.max[b] > max) max = peaks.max[b];
+      }
+    } else {
+      // Zoomed in: few samples per pixel, read them all
+      for (let s = sampleStart; s < end; s++) {
+        const val = (chan0[s] + chan1[s]) * 0.5;
+        if (val < min) min = val;
+        if (val > max) max = val;
+      }
     }
 
     // Apply clip gain + fade-in/out visual scaling
