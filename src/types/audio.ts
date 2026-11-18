@@ -14,11 +14,15 @@ export interface TrackEffects {
   eqMidFreq: number;       // 250 to 5000 Hz
   eqMidQ: number;          // 0.3 to 8.0
   eqHighGain: number;      // -18 to +18 dB (7500 Hz)
+  /** Parametric EQ (6 bands). When absent, the 3-band fields above are used (see resolveEq). */
+  eq?: EqBand[];
   compEnabled: boolean;
   compThreshold: number;   // -60 to 0 dB
   compRatio: number;       // 1 to 20
   compAttack: number;      // 0.001 to 0.2 sec
   compRelease: number;     // 0.02 to 1.0 sec
+  /** Parallel compression: compressed share of the signal (0 to 100 %, default 100) */
+  compMix?: number;
   reverbMix: number;       // 0 to 1
   reverbDecay: number;     // 0.4 to 5.0 sec
   delayMix: number;        // 0 to 1
@@ -59,8 +63,10 @@ export type BufferOperationType =
 export interface ClipProcessSettings {
   /** Auto-Pitch Tune strength (0 to 100 %) */
   autoPitch: number;
-  /** 3-Part Vocal Harmony blend (0 to 100 %) */
+  /** Harmony / double voice level (0 to 100 %) */
   harmony: number;
+  /** Which harmony voices to generate (missing in older projects = 'choir') */
+  harmonyStyle?: HarmonyStyle;
   /** Voice Softener / De-Esser & Warmth (0 to 100 %) */
   voiceSoften: number;
   /** Noise & Hiss Gate Removal (0 to 100 %) */
@@ -76,6 +82,13 @@ export interface ClipProcessSettings {
   /** Whether the clip or region is reversed */
   reverse: boolean;
 }
+
+/**
+ * Harmony voices generated from the sung line (in the track's key):
+ *  choir: a 3rd and a 5th above (left/right) · thirdUp / thirdDown / fifth / octaveDown: one voice
+ *  double: two natural double-tracked copies (left/right)
+ */
+export type HarmonyStyle = 'choir' | 'thirdUp' | 'thirdDown' | 'fifth' | 'octaveDown' | 'double';
 
 export const DEFAULT_CLIP_PROCESSES: ClipProcessSettings = {
   autoPitch: 0,
@@ -151,6 +164,27 @@ export interface AudioTrack {
   automation?: TrackAutomation;
   /** Automation lane visible under the track */
   showAutomation?: boolean;
+  /** Ducking: this track dips while another track (the key, e.g. the vocal) plays */
+  duck?: TrackDuck;
+}
+
+export type EqBandType = 'highpass' | 'lowshelf' | 'peaking' | 'highshelf' | 'lowpass';
+
+export interface EqBand {
+  type: EqBandType;
+  /** Hz, 20 to 20000 */
+  freq: number;
+  /** dB, -18 to +18 (ignored by highpass / lowpass) */
+  gain: number;
+  /** Bandwidth / resonance, 0.3 to 10 (ignored by shelves) */
+  q: number;
+  on: boolean;
+}
+
+export interface TrackDuck {
+  keyTrackId: string;
+  /** Maximum reduction in dB (0 to 18) */
+  amountDb: number;
 }
 
 export interface TrackSends {
@@ -230,6 +264,8 @@ export interface MeterLevels {
   masterRmsDb: number;     // dBFS (LUFS approx)
   phaseCorrelation: number;// -1 to +1
   trackLevels: Record<string, number>;
+  /** Compressor gain reduction per track in dB (0 = none, negative = reducing) */
+  trackReduction: Record<string, number>;
 }
 
 export type MasterPresetId = 'off' | 'streaming' | 'loud' | 'warm' | 'voice' | 'custom';

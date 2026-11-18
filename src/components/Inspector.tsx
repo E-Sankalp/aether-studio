@@ -28,6 +28,7 @@ import {
   ClipProcessSettings,
   DEFAULT_CLIP_PROCESSES,
   HarmonyMode,
+  HarmonyStyle,
   TrackEffects,
   WaveformSelection,
 } from '../types/audio';
@@ -36,10 +37,46 @@ import { applyPresetValues, MUSIC_PRESETS, VOCAL_SCALES, VOICE_PRESETS } from '.
 import { drawBufferWaveform } from '../utils/waveformDraw';
 import { ParamSlider, RangeInput } from './ParamSlider';
 import { TrackLevelBar } from './Arrangement';
+import { ParametricEq } from './ParametricEq';
+import { eqResponseDb, resolveEq } from '../audio/eq';
+import { meterStore, useLiveStore } from '../utils/liveStore';
 
 export type InspectorTab = 'edit' | 'fx' | 'mixer';
 
+const HARMONY_STYLES: { id: HarmonyStyle; label: string; hint: string }[] = [
+  { id: 'choir', label: 'Choir', hint: 'A 3rd and a 5th above, spread left and right' },
+  { id: 'thirdUp', label: '3rd up', hint: 'One voice a third above (major or minor, following the key)' },
+  { id: 'thirdDown', label: '3rd down', hint: 'One voice a third below' },
+  { id: 'fifth', label: '5th up', hint: 'One voice a fifth above' },
+  { id: 'octaveDown', label: 'Octave dn', hint: 'One voice an octave below' },
+  { id: 'double', label: 'Double', hint: 'Natural double-tracked copies left and right (no new notes)' },
+];
+
 /* ----------------------------- small primitives ---------------------------- */
+
+/** Live compressor gain reduction (0 to -20 dB), drawn from the right like a hardware GR meter. */
+const GainReductionMeter: React.FC<{ trackId: string; active: boolean }> = ({ trackId, active }) => {
+  // Half-dB steps: re-renders only when the reading visibly changes
+  const gr = useLiveStore(meterStore, (m) => Math.round(Math.min(0, m.trackReduction[trackId] ?? 0) * 2) / 2);
+  const pct = Math.min(100, (-gr / 20) * 100);
+  return (
+    <div className="flex items-center gap-3 mb-3" aria-label="Gain reduction" role="meter" aria-valuemin={-20} aria-valuemax={0} aria-valuenow={gr}>
+      <span className="text-[11px] text-mute shrink-0 w-[70px]">Reduction</span>
+      <div className="relative flex-1 h-2 rounded-full bg-app overflow-hidden">
+        <div
+          className={`absolute inset-y-0 right-0 rounded-full transition-[width] duration-75 ${active ? 'bg-amber-400' : 'bg-raised'}`}
+          style={{ width: `${active ? pct : 0}%` }}
+        />
+        {[3, 6, 10].map((d) => (
+          <span key={d} className="absolute inset-y-0 w-px bg-white/15" style={{ right: `${(d / 20) * 100}%` }} />
+        ))}
+      </div>
+      <span className="font-mono text-[11px] text-mute w-[64px] shrink-0 whitespace-nowrap text-right tabular-nums">
+        {active && gr < 0 ? `${gr.toFixed(1)} dB` : '0.0 dB'}
+      </span>
+    </div>
+  );
+};
 
 const Section: React.FC<{
   title: string;
@@ -255,6 +292,8 @@ const EditPanel: React.FC<EditPanelProps> = ({
 
   const patch = (p: Partial<AudioClip>) => onUpdateClip(selectedClip.id, p);
   const proc: ClipProcessSettings = { ...DEFAULT_CLIP_PROCESSES, ...selectedClip.processes };
+  const scaleLabel =
+    VOCAL_SCALES.find((v) => v.id === (selectedTrack?.effects.autoPitchScale ?? 'C_major'))?.label ?? 'C major';
   const gainDb = 20 * Math.log10(selectedClip.gain);
 
   // Build active process badges so the user always sees what settings are applied
@@ -276,7 +315,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
   if (proc.harmony > 0) {
     appliedProcessItems.push({
       key: 'harmony',
-      label: '3-Part Harmony',
+      label: HARMONY_STYLES.find((h) => h.id === (proc.harmonyStyle ?? 'choir'))?.label ?? 'Harmony',
       value: `${Math.round(proc.harmony)}%`,
       onClear: () => onUpdateClipProcesses({ harmony: 0 }),
     });
@@ -525,7 +564,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
           />
           <ActionButton
             icon={Users}
-            label="3-Part harmony"
+            label="Harmony"
             tone="accent"
             active={proc.harmony > 0}
             badge={proc.harmony > 0 ? `${Math.round(proc.harmony)}%` : undefined}
@@ -641,7 +680,7 @@ const EditPanel: React.FC<EditPanelProps> = ({
             onCommit={(v) => onUpdateClipProcesses({ autoPitch: v })}
           />
           <ParamSlider
-            label="3-Part harmony"
+            label="Harmony / double level"
             value={proc.harmony}
             min={0}
             max={100}
@@ -650,6 +689,33 @@ const EditPanel: React.FC<EditPanelProps> = ({
             format={(v) => `${Math.round(v)}%`}
             onCommit={(v) => onUpdateClipProcesses({ harmony: v })}
           />
+          <div className="pb-2">
+            <div className="text-[11px] text-mute mb-1.5">
+              Harmony voices <span className="text-mute/70">· follow the track's key ({scaleLabel})</span>
+            </div>
+            <div className="grid grid-cols-3 gap-1" role="radiogroup" aria-label="Harmony style">
+              {HARMONY_STYLES.map((h) => {
+                const on = (proc.harmonyStyle ?? 'choir') === h.id;
+                return (
+                  <button
+                    key={h.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={on}
+                    title={h.hint}
+                    onClick={() =>
+                      onUpdateClipProcesses({ harmonyStyle: h.id, harmony: proc.harmony > 0 ? proc.harmony : 65 })
+                    }
+                    className={`h-8 rounded-lg text-[11px] font-semibold transition-colors ${
+                      on && proc.harmony > 0 ? 'bg-accent text-white' : on ? 'bg-accent/15 text-accent' : 'bg-raised text-mute hover:text-ink'
+                    }`}
+                  >
+                    {h.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <ParamSlider
             label="Voice soften"
             value={proc.voiceSoften}
@@ -794,21 +860,19 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
     const soft = (fx.voiceSoftener ?? 0) / 100;
     const hpCut = 20 + nr * 135;
     const lpCut = 20000 - Math.pow(nr, 0.85) * 14500;
+    const bands = resolveEq(fx);
 
     ctx.beginPath();
     for (let px = 0; px <= width; px += 2) {
       const freq = 20 * Math.pow(1000, px / width);
-      const low = fx.eqLowGain / (1 + Math.pow(freq / 130, 2.2));
-      const oct = Math.log2(freq / fx.eqMidFreq);
-      const bw = 1.2 / Math.max(0.3, fx.eqMidQ);
-      const mid = fx.eqMidGain * Math.exp(-(oct * oct) / (2 * bw * bw));
-      const high = (fx.eqHighGain - soft * 2.5) / (1 + Math.pow(5500 / freq, 2.2));
+      const eqDb = eqResponseDb(bands, freq);
+      const high = (-soft * 2.5) / (1 + Math.pow(5500 / freq, 2.2));
       const warm = soft * 4.5 * Math.exp(-Math.pow(Math.log2(freq / 240), 2) / 0.8);
       const deEss = -soft * 11 * Math.exp(-Math.pow(Math.log2(freq / 4600), 2) / 0.25);
       const hp = nr > 0.01 && freq < hpCut ? -18 * Math.pow(1 - freq / hpCut, 1.6) : 0;
       const lp =
         nr > 0.01 && freq > lpCut ? -18 * Math.pow((freq - lpCut) / (20000 - lpCut), 1.4) : 0;
-      const total = Math.max(-18, Math.min(18, low + mid + high + warm + deEss + hp + lp));
+      const total = Math.max(-18, Math.min(18, eqDb + high + warm + deEss + hp + lp));
       const py = midY - (total / 20) * (height * 0.45);
       if (px === 0) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
@@ -982,7 +1046,7 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
               className="w-full h-8 rounded-lg bg-raised hover:bg-[#2b2b31] text-ink text-xs font-medium flex items-center justify-center gap-1.5 transition-colors"
             >
               <Users className="w-3.5 h-3.5 text-accent" />
-              Render 3-Part Harmony onto clip
+              Add harmony to the selected clip
             </button>
           </div>
         )}
@@ -1088,22 +1152,45 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
         />
       </Section>
 
-      <Section title="Equalizer">
-        <ParamSlider label="Low · 110 Hz" value={fx.eqLowGain} min={-18} max={18} step={0.5} defaultValue={0} format={db} onChange={(v) => set({ eqLowGain: v })} />
-        <ParamSlider label="Mid gain" value={fx.eqMidGain} min={-18} max={18} step={0.5} defaultValue={0} format={db} onChange={(v) => set({ eqMidGain: v })} />
-        <ParamSlider label="Mid frequency" value={fx.eqMidFreq} min={250} max={5000} step={50} defaultValue={1200} format={(v) => `${Math.round(v)} Hz`} onChange={(v) => set({ eqMidFreq: v })} />
-        <ParamSlider label="Mid Q" value={fx.eqMidQ} min={0.3} max={8} step={0.1} defaultValue={1.2} format={(v) => v.toFixed(1)} onChange={(v) => set({ eqMidQ: v })} />
-        <ParamSlider label="High · 7.5 kHz" value={fx.eqHighGain} min={-18} max={18} step={0.5} defaultValue={0} format={db} onChange={(v) => set({ eqHighGain: v })} />
+      <Section
+        title="Equalizer"
+        right={
+          fx.eq ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                set({ eq: undefined, eqLowGain: 0, eqMidGain: 0, eqMidFreq: 1200, eqMidQ: 1.2, eqHighGain: 0 });
+              }}
+              className="h-6 px-2 rounded-md bg-app text-mute text-[11px] font-semibold hover:text-white"
+            >
+              Flat
+            </button>
+          ) : undefined
+        }
+      >
+        <ParametricEq trackId={selectedTrack.id} bands={resolveEq(fx)} onChange={(eq) => set({ eq })} />
       </Section>
 
       <Section
         title="Compressor"
         right={<Switch on={fx.compEnabled} onChange={(on) => set({ compEnabled: on })} />}
       >
+        <GainReductionMeter trackId={selectedTrack.id} active={fx.compEnabled} />
         <ParamSlider label="Threshold" value={fx.compThreshold} min={-50} max={0} step={1} defaultValue={-24} format={(v) => `${v} dB`} onChange={(v) => set({ compThreshold: v })} />
         <ParamSlider label="Ratio" value={fx.compRatio} min={1} max={20} step={0.5} defaultValue={4} format={(v) => `${v.toFixed(1)}:1`} onChange={(v) => set({ compRatio: v })} />
         <ParamSlider label="Attack" value={fx.compAttack * 1000} min={1} max={150} step={1} defaultValue={10} format={(v) => `${Math.round(v)} ms`} onChange={(v) => set({ compAttack: v / 1000 })} />
         <ParamSlider label="Release" value={fx.compRelease * 1000} min={20} max={800} step={10} defaultValue={150} format={(v) => `${Math.round(v)} ms`} onChange={(v) => set({ compRelease: v / 1000 })} />
+        <ParamSlider
+          label="Mix (parallel)"
+          value={fx.compMix ?? 100}
+          min={0}
+          max={100}
+          step={1}
+          defaultValue={100}
+          format={(v) => (v >= 100 ? '100% wet' : `${Math.round(v)}% wet`)}
+          onChange={(v) => set({ compMix: v })}
+        />
         <ParamSlider label="Tube drive" value={fx.drive} min={0} max={100} step={1} defaultValue={0} format={pct} onChange={(v) => set({ drive: v })} />
       </Section>
 
@@ -1117,6 +1204,67 @@ const EffectsPanel: React.FC<EffectsPanelProps> = ({
 };
 
 /* -------------------------------- mixer panel ------------------------------ */
+
+/** "25 L", "25% R", "-25", "c"/"center" -> pan value (-1..1). */
+const parsePan = (text: string): number | null => {
+  const t = text.trim().toLowerCase();
+  if (/^c(ent(er|re))?$/.test(t)) return 0;
+  const m = /(-?\d+(?:\.\d+)?)/.exec(t);
+  if (!m) return null;
+  let n = parseFloat(m[1]) / 100;
+  if (/l/.test(t) && n > 0) n = -n;
+  return Math.max(-1, Math.min(1, n));
+};
+
+/** "Duck under": the track dips automatically while another track (usually the vocal) plays. */
+const DuckControls: React.FC<{
+  track: AudioTrack;
+  tracks: AudioTrack[];
+  onUpdateTrack: (trackId: string, patch: Partial<AudioTrack>) => void;
+}> = ({ track, tracks, onUpdateTrack }) => {
+  const others = tracks.filter((t) => t.id !== track.id);
+  const key = track.duck && others.some((t) => t.id === track.duck!.keyTrackId) ? track.duck : undefined;
+  return (
+    <div className="mb-1">
+      <div className="flex items-center justify-between gap-3 mb-1.5">
+        <label htmlFor={`duck-${track.id}`} className="text-[11px] text-mute">
+          Duck under
+        </label>
+        <select
+          id={`duck-${track.id}`}
+          value={key?.keyTrackId ?? ''}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => {
+            const id = e.target.value;
+            onUpdateTrack(track.id, {
+              duck: id ? { keyTrackId: id, amountDb: track.duck?.amountDb || 6 } : undefined,
+            });
+          }}
+          className="min-w-0 max-w-[60%] h-7 rounded-md bg-app border border-line px-2 text-[12px] text-white"
+        >
+          <option value="">Off</option>
+          {others.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      {key && (
+        <ParamSlider
+          label="Duck amount"
+          value={key.amountDb}
+          min={1}
+          max={18}
+          step={0.5}
+          defaultValue={6}
+          format={(v) => `-${v.toFixed(1)} dB`}
+          onChange={(v) => onUpdateTrack(track.id, { duck: { keyTrackId: key.keyTrackId, amountDb: v } })}
+        />
+      )}
+    </div>
+  );
+};
 
 interface MixerPanelProps {
   tracks: AudioTrack[];
@@ -1151,6 +1299,8 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
           step={0.01}
           defaultValue={1}
           className="w-full mt-2"
+          ariaLabel="Master volume"
+          format={volText}
           onChange={onMasterVolume}
         />
       </div>
@@ -1221,8 +1371,10 @@ const MixerPanel: React.FC<MixerPanelProps> = ({
               format={(v) =>
                 Math.abs(v) < 0.04 ? 'Center' : v < 0 ? `${Math.round(-v * 100)}% L` : `${Math.round(v * 100)}% R`
               }
+              parse={parsePan}
               onChange={(v) => onUpdateTrack(track.id, { pan: v })}
             />
+            <DuckControls track={track} tracks={tracks} onUpdateTrack={onUpdateTrack} />
             <div className="grid grid-cols-2 gap-x-3">
               <ParamSlider
                 label="Reverb send"

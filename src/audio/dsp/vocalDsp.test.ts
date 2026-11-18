@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { deEss, fft, psolaAutotune, spectralDenoise } from './vocalDsp';
-import { db, harmonicTone, noise, peakHz, power, spectrum, SR } from '../../test/signals';
+import { deEss, diatonicShift, doubleVoice, fft, harmonyVoice, psolaAutotune, spectralDenoise } from './vocalDsp';
+import { renderClipChannels } from './clipDsp';
+import { DEFAULT_CLIP_PROCESSES } from '../../types/audio';
+import { db, harmonicTone, noise, peakHz, power, spectrum, SR, voiceTone } from '../../test/signals';
 
 describe('fft', () => {
   it('round-trips (forward + inverse / N)', () => {
@@ -105,5 +107,76 @@ describe('psolaAutotune', () => {
     const x = harmonicTone(220, 1.5); // A3, in C major
     const y = psolaAutotune(x, 0, x.length, SR, [0, 2, 4, 5, 7, 9, 11], 0, 1);
     expect(peakHz(spectrum(y), 150, 300)).toBeCloseTo(220, -1);
+  });
+});
+
+describe('harmonies', () => {
+  const C_MAJOR = [0, 2, 4, 5, 7, 9, 11];
+
+  it('diatonic intervals follow the key', () => {
+    expect(diatonicShift(60, 2, C_MAJOR)).toBe(64); // C -> E (major 3rd)
+    expect(diatonicShift(64, 2, C_MAJOR)).toBe(67); // E -> G (minor 3rd)
+    expect(diatonicShift(71, 2, C_MAJOR)).toBe(74); // B -> D (next octave)
+    expect(diatonicShift(60, -2, C_MAJOR)).toBe(57); // C -> A below
+    expect(diatonicShift(60, 4, C_MAJOR)).toBe(67); // C -> G (5th)
+    expect(diatonicShift(60, 2, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])).toBe(64); // chromatic: major 3rd
+  });
+
+  it('a third above is major or minor depending on the sung note (C major)', () => {
+    for (const [f0, expected] of [
+      [261.63, 329.63], // C4 -> E4
+      [329.63, 392.0], // E4 -> G4
+    ]) {
+      const x = voiceTone(f0, 1.5);
+      const v = harmonyVoice(x, 0, x.length, SR, C_MAJOR, 2);
+      const found = peakHz(spectrum(v), expected * 0.85, expected * 1.15);
+      expect(Math.abs(found - expected) / expected).toBeLessThan(0.02);
+    }
+  });
+
+  it('keeps the singer\u2019s formant', () => {
+    const x = harmonicTone(200, 2, 1000);
+    const v = harmonyVoice(x, 0, x.length, SR, C_MAJOR, 4); // 5th up: ~300 Hz
+    const formant = peakHz(spectrum(v), 600, 1600);
+    expect(formant).toBeGreaterThan(880);
+    expect(formant).toBeLessThan(1150); // resampling would move it to ~1500
+  });
+
+  it('the doubler is a slightly late, barely detuned copy', () => {
+    const x = harmonicTone(220, 2);
+    for (let i = 0; i < x.length; i++) x[i] *= 0.6 + 0.4 * Math.sin((2 * Math.PI * 3 * i) / SR); // envelope to correlate
+    const v = doubleVoice(x, 0, x.length, SR, 1);
+    // timing offset from the envelope cross-correlation
+    let bestLag = 0;
+    let best = -Infinity;
+    for (let lag = 0; lag < SR * 0.04; lag += 8) {
+      let s = 0;
+      for (let i = SR * 0.2; i < SR * 1.6; i += 16) s += Math.abs(x[i]) * Math.abs(v[i + lag]);
+      if (s > best) {
+        best = s;
+        bestLag = lag;
+      }
+    }
+    expect(bestLag / SR).toBeGreaterThan(0.012);
+    expect(bestLag / SR).toBeLessThan(0.03);
+    const f = peakHz(spectrum(v), 180, 260);
+    expect(Math.abs(1200 * Math.log2(f / 220))).toBeLessThan(15); // within 15 cents
+  });
+
+  it('choir harmony turns a mono take into stereo', () => {
+    const x = harmonicTone(261.63, 1);
+    const out = renderClipChannels({
+      channels: [x],
+      sampleRate: SR,
+      startSample: 0,
+      endSample: x.length,
+      processes: { ...DEFAULT_CLIP_PROCESSES, harmony: 100, harmonyStyle: 'choir' },
+      scaleSemitones: C_MAJOR,
+      pitchSemitones: 0,
+    });
+    expect(out).toHaveLength(2);
+    let diff = 0;
+    for (let i = 0; i < x.length; i += 7) diff += Math.abs(out[0][i] - out[1][i]);
+    expect(diff).toBeGreaterThan(1); // left and right carry different voices
   });
 });

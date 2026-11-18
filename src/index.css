@@ -173,34 +173,10 @@ input.no-spinner {
   background: transparent;
 }
 
-/* Flat slider with filled track (fill is set inline via background gradient) */
-input[type="range"].param-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  height: 4px;
-  border-radius: 999px;
-  outline: none;
-  cursor: pointer;
-  touch-action: none;
-}
-
-input[type="range"].param-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
-}
-
-input[type="range"].param-slider::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
-  border: none;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+/* Precision slider: vertical touch gestures scroll the page, horizontal drags adjust */
+.precision-slider {
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* Toast entrance */

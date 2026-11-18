@@ -12,6 +12,7 @@ import { DEFAULT_MASTER } from './audio/mastering';
 import { DEFAULT_RETURNS, FxReturns } from './types/audio';
 import { FxReturnsPanel } from './components/FxReturnsPanel';
 import { MasteringPanel } from './components/MasteringPanel';
+import { ReferencePanel, ReferencePill } from './components/ReferencePanel';
 import { LatencyPanel } from './components/LatencyPanel';
 import { notify, Toaster } from './components/Toaster';
 import { ShortcutsDialog } from './components/ShortcutsDialog';
@@ -41,8 +42,9 @@ import {
   generateVocalStem,
 } from './audio/synthStems';
 import { buildTemplate, TemplateId, TRACK_COLORS } from './audio/projectTemplates';
-import { ExportMenu } from './components/ExportMenu';
-import { ExportFormatId, encodeAudioBuffer, getExportFormat } from './audio/audioEncoders';
+import { ExportMenu, ExportOptions } from './components/ExportMenu';
+import { createZip } from './utils/zip';
+import { ExportFormatId, encodeAudioBuffer, getExportFormat, maxSampleRateFor } from './audio/audioEncoders';
 import { Arrangement } from './components/Arrangement';
 import { AddTrackMenu, STEM_LABELS, StemType } from './components/AddTrackMenu';
 import { Inspector, InspectorTabs, InspectorTab } from './components/Inspector';
@@ -371,7 +373,7 @@ export const App: React.FC = () => {
     audioEngine.setMasterSettings(next);
   }, []);
 
-  const handleAnalyzeLoudness = async () => {
+  const handleAnalyzeLoudness = async (): Promise<LoudnessReport | null> => {
     setIsAnalyzing(true);
     try {
       const { report } = await audioEngine.renderMasteredMixdown(tracks, clips, masterVolume, master);
@@ -379,9 +381,11 @@ export const App: React.FC = () => {
       setReportStale(false);
       // Match playback loudness to what the export will sound like
       audioEngine.setMasterSettings(master, report.gainDb);
+      return report;
     } catch (err) {
       console.error('Loudness analysis failed:', err);
       notify('Could not analyze the mix. Please try again.', 'error');
+      return null;
     } finally {
       setIsAnalyzing(false);
     }
@@ -1008,30 +1012,88 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleExport = async (formatId: ExportFormatId) => {
+  const downloadBlob = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
+  /** One file per (unmuted, non-empty) track, zipped. Unmastered, same length, same sample rate. */
+  const exportStems = async (formatId: ExportFormatId, sampleRate: number, safeName: string) => {
+    const format = getExportFormat(formatId);
+    const stemTracks = tracks.filter((t) => !t.muted && clips.some((c) => c.trackId === t.id));
+    if (stemTracks.length === 0) {
+      notify('There are no unmuted tracks with clips to export.', 'warn');
+      return;
+    }
+    const entries: { name: string; data: Uint8Array }[] = [];
+    const clipped: string[] = [];
+    for (let i = 0; i < stemTracks.length; i++) {
+      const t = stemTracks[i];
+      const buffer = await audioEngine.renderMixdown(tracks, clips, masterVolume, undefined, returns, bpm, {
+        sampleRate,
+        onlyTrackId: t.id,
+      });
+      let peak = 0;
+      for (let c = 0; c < buffer.numberOfChannels; c++) {
+        const d = buffer.getChannelData(c);
+        for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k]));
+      }
+      if (peak > 1) clipped.push(t.name);
+      const blob = await encodeAudioBuffer(buffer, formatId);
+      const trackName = t.name.replace(/[^\p{L}\p{N} _-]+/gu, '').trim() || `Track ${i + 1}`;
+      entries.push({
+        name: `${String(i + 1).padStart(2, '0')} ${trackName}.${format.extension}`,
+        data: new Uint8Array(await blob.arrayBuffer()),
+      });
+    }
+    const fileName = `${safeName}_${bpm}BPM_stems.zip`;
+    downloadBlob(createZip(entries), fileName);
+    notify(`Exported ${entries.length} stems (${fileName})`, 'success');
+    if (clipped.length > 0) {
+      notify(
+        `${clipped.join(', ')} ${clipped.length === 1 ? 'goes' : 'go'} above 0 dB and will distort. ` +
+          `Turn ${clipped.length === 1 ? 'that track' : 'those tracks'} (or the master) down a little and export again.`,
+        'warn',
+        12000
+      );
+    }
+  };
+
+  const handleExport = async (
+    formatId: ExportFormatId,
+    options: ExportOptions = { sampleRate: 44100, stems: false }
+  ) => {
     setIsExporting(true);
     try {
       const format = getExportFormat(formatId);
+      const sampleRate = Math.min(options.sampleRate, maxSampleRateFor(formatId));
+      const safeName = (projectName || 'AETHER_Mixdown').replace(/[^a-zA-Z0-9_-]+/g, '_');
+      if (options.stems) {
+        await exportStems(formatId, sampleRate, safeName);
+        return;
+      }
       const { buffer: rendered, report } = await audioEngine.renderMasteredMixdown(
         tracks,
         clips,
         masterVolume,
-        master
+        master,
+        returns,
+        bpm,
+        { sampleRate }
       );
       setLoudnessReport(report);
       setReportStale(false);
       audioEngine.setMasterSettings(master, report.gainDb);
       const blob = await encodeAudioBuffer(rendered, formatId);
-      const safeName = (projectName || 'AETHER_Mixdown').replace(/[^a-zA-Z0-9_-]+/g, '_');
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${safeName}_${bpm}BPM.${format.extension}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      notify(`Exported ${a.download}`, 'success');
+      const fileName = `${safeName}_${bpm}BPM.${format.extension}`;
+      downloadBlob(blob, fileName);
+      notify(`Exported ${fileName}`, 'success');
       if (report.truePeakDb > 0) {
         // Only possible with mastering off: the file is clipped
         notify(
@@ -1128,6 +1190,12 @@ export const App: React.FC = () => {
           reportStale={reportStale}
           analyzing={isAnalyzing}
           onAnalyze={handleAnalyzeLoudness}
+        />
+        <ReferencePanel
+          report={loudnessReport}
+          reportStale={reportStale}
+          masterOff={master.preset === 'off'}
+          onMeasureMix={handleAnalyzeLoudness}
         />
         <LatencyPanel disabled={isRecording || countInBeat !== null} />
       </>
@@ -1506,6 +1574,7 @@ export const App: React.FC = () => {
       }}
     >
       <Toaster />
+      <ReferencePill />
       <input
         ref={fileInputRef}
         type="file"

@@ -286,32 +286,21 @@ function snapToScale(midi: number, scale: number[]): number {
   return best;
 }
 
-/**
- * Pitch correction with TD-PSOLA. Each voiced pitch period is cut out with a 2-period window
- * and overlap-added at the corrected period spacing, so the pitch moves while the spectral
- * envelope (formants: the "character" of the voice) stays where it was.
- *
- * `strength` 0..1 blends from natural to fully snapped; `speed` 0..1 is the retune speed
- * (1 = instant "hard-tune", lower = smoother, more natural glides).
- * Returns the processed region (length end - start); the input is not modified.
- */
-export function psolaAutotune(
-  x: Float32Array,
-  start: number,
-  end: number,
-  sr: number,
-  scale: number[],
-  strength: number,
-  speed = 0.75
-): Float32Array {
+/* ------------------------------ PSOLA building blocks ------------------------ */
+
+export interface PitchTrack {
+  /** Analysis hop in samples */
+  hop: number;
+  /** Period (samples) per hop, 0 = unvoiced */
+  period: Float64Array;
+}
+
+/** Pitch track of x[start, end): 5 ms hops, 40 ms frames, median-of-3 smoothed. */
+export function trackPitch(x: Float32Array, start: number, end: number, sr: number): PitchTrack {
   const count = end - start;
-  const out = new Float32Array(count);
-  if (count < sr * 0.05) return out.fill(0);
   const hop = Math.floor(sr * 0.005);
   const frame = Math.floor(sr * 0.04);
   const hops = Math.ceil(count / hop) + 1;
-
-  // 1. Pitch track (period in samples, 0 = unvoiced) + median-of-3 smoothing
   const raw = new Float64Array(hops);
   for (let h = 0; h < hops; h++) raw[h] = detectPeriod(x, start + h * hop, sr, frame) ?? 0;
   const period = new Float64Array(hops);
@@ -322,34 +311,36 @@ export function psolaAutotune(
       .sort((a, b) => a - b);
     period[h] = voicedNeighbours[Math.floor(voicedNeighbours.length / 2)];
   }
+  return { hop, period };
+}
 
-  // 2. Target ratio per hop (snap to scale, blend by strength, smooth by retune speed)
-  const ratio = new Float64Array(hops).fill(1);
-  const k = 0.02 + 0.6 * Math.max(0, Math.min(1, speed));
-  let r = 1;
-  for (let h = 0; h < hops; h++) {
-    if (period[h] > 0) {
-      const f0 = sr / period[h];
-      const midi = 69 + 12 * Math.log2(f0 / 440);
-      const target = snapToScale(midi, scale);
-      const semis = (target - midi) * Math.max(0, Math.min(1, strength));
-      const want = Math.pow(2, semis / 12);
-      r = r + k * (want - r);
-    } else {
-      r = r + 0.3 * (1 - r);
-    }
-    ratio[h] = r;
-  }
+/**
+ * TD-PSOLA resynthesis of x[start, end) with a pitch ratio per hop (1 = unchanged). Grains are
+ * pitch-synchronous, so formants stay put. `edges`: crossfade the region edges into the original
+ * signal (in-place correction) or fade from/to silence (a new voice that is mixed in).
+ */
+export function psolaResynth(
+  x: Float32Array,
+  start: number,
+  end: number,
+  sr: number,
+  track: PitchTrack,
+  ratio: Float64Array,
+  edges: 'original' | 'silence' = 'original'
+): Float32Array {
+  const count = end - start;
+  const out = new Float32Array(count);
+  const { hop, period } = track;
+  const hops = period.length;
 
-  // 3. Analysis marks: pitch-synchronous in voiced parts (aligned to waveform peaks),
-  //    fixed 5 ms spacing in unvoiced parts
+  // Analysis marks: pitch-synchronous in voiced parts (aligned to waveform peaks),
+  // fixed spacing in unvoiced parts
   const marks: number[] = [];
   const markPeriod: number[] = [];
   let t = 0;
   while (t < count) {
     const P = period[Math.min(hops - 1, Math.floor(t / hop))];
     if (P > 0) {
-      // refine to the strongest peak near the predicted position
       const lo = Math.max(0, Math.floor(t - P * 0.2));
       const hi = Math.min(count - 1, Math.ceil(t + P * 0.2));
       let best = Math.round(t);
@@ -373,11 +364,11 @@ export function psolaAutotune(
     }
   }
   if (marks.length < 2) {
-    out.set(x.subarray(start, end));
+    if (edges === 'original') out.set(x.subarray(start, end));
     return out;
   }
 
-  // 4. Synthesis: walk output time with the corrected period, OLA the nearest analysis grain
+  // Synthesis: walk output time with the new period, OLA the nearest analysis grain
   const weight = new Float32Array(count);
   let ts = marks[0];
   let mi = 0;
@@ -399,14 +390,136 @@ export function psolaAutotune(
     ts += voiced ? Pa / rr : hop;
   }
   for (let i = 0; i < count; i++) {
-    out[i] = weight[i] > 0.05 ? out[i] / weight[i] : x[start + i];
+    out[i] = weight[i] > 0.05 ? out[i] / weight[i] : edges === 'original' ? x[start + i] : 0;
   }
-  // 5 ms crossfades with the original at the region edges (no clicks)
+  // 5 ms edge fades (no clicks)
   const xf = Math.min(Math.floor(sr * 0.005), Math.floor(count / 4));
   for (let i = 0; i < xf; i++) {
     const g = i / xf;
-    out[i] = out[i] * g + x[start + i] * (1 - g);
-    out[count - 1 - i] = out[count - 1 - i] * g + x[end - 1 - i] * (1 - g);
+    const a0 = edges === 'original' ? x[start + i] : 0;
+    const a1 = edges === 'original' ? x[end - 1 - i] : 0;
+    out[i] = out[i] * g + a0 * (1 - g);
+    out[count - 1 - i] = out[count - 1 - i] * g + a1 * (1 - g);
   }
+  return out;
+}
+
+const midiOf = (periodSamples: number, sr: number) => 69 + 12 * Math.log2(sr / periodSamples / 440);
+
+/**
+ * Pitch correction with TD-PSOLA. Each voiced pitch period is cut out with a 2-period window
+ * and overlap-added at the corrected period spacing, so the pitch moves while the spectral
+ * envelope (formants: the "character" of the voice) stays where it was.
+ *
+ * `strength` 0..1 blends from natural to fully snapped; `speed` 0..1 is the retune speed
+ * (1 = instant "hard-tune", lower = smoother, more natural glides).
+ * Returns the processed region (length end - start); the input is not modified.
+ */
+export function psolaAutotune(
+  x: Float32Array,
+  start: number,
+  end: number,
+  sr: number,
+  scale: number[],
+  strength: number,
+  speed = 0.75
+): Float32Array {
+  const count = end - start;
+  if (count < sr * 0.05) return new Float32Array(count);
+  const track = trackPitch(x, start, end, sr);
+  const { period } = track;
+  const ratio = new Float64Array(period.length).fill(1);
+  const k = 0.02 + 0.6 * Math.max(0, Math.min(1, speed));
+  let r = 1;
+  for (let h = 0; h < period.length; h++) {
+    if (period[h] > 0) {
+      const midi = midiOf(period[h], sr);
+      const semis = (snapToScale(midi, scale) - midi) * Math.max(0, Math.min(1, strength));
+      r = r + k * (Math.pow(2, semis / 12) - r);
+    } else {
+      r = r + 0.3 * (1 - r);
+    }
+    ratio[h] = r;
+  }
+  return psolaResynth(x, start, end, sr, track, ratio, 'original');
+}
+
+/* -------------------------------- harmonies --------------------------------- */
+
+/** Note `steps` scale degrees above (or below) `note` (an in-scale MIDI note). */
+export function diatonicShift(note: number, steps: number, scale: number[]): number {
+  const pcs = [...new Set((scale.length ? scale : [0, 2, 4, 5, 7, 9, 11]).map((p) => ((p % 12) + 12) % 12))].sort(
+    (a, b) => a - b
+  );
+  if (pcs.length >= 12) {
+    // Chromatic "scale": use the common major-key intervals instead of semitone steps
+    const semis: Record<number, number> = { 2: 4, 4: 7, 7: 12, [-2]: -3, [-3]: -5, [-4]: -7, [-7]: -12 };
+    return note + (semis[steps] ?? steps);
+  }
+  const n = pcs.length;
+  const oct = Math.floor(note / 12);
+  const pc = ((note % 12) + 12) % 12;
+  let idx = pcs.indexOf(pc);
+  if (idx < 0) idx = pcs.reduce((b, p, i) => (Math.abs(p - pc) < Math.abs(pcs[b] - pc) ? i : b), 0);
+  const k = idx + steps;
+  const octShift = Math.floor(k / n);
+  return (oct + octShift) * 12 + pcs[((k % n) + n) % n];
+}
+
+/**
+ * A harmony voice `steps` scale degrees from the sung note (2 = a third, 4 = a fifth,
+ * -2 = a third below, 7 = an octave in a 7-note scale). The interval follows the key, so a third
+ * is major or minor depending on where the melody is, like a real backing singer. The voice
+ * keeps the lead's natural intonation and vibrato; only the interval is added.
+ */
+export function harmonyVoice(
+  x: Float32Array,
+  start: number,
+  end: number,
+  sr: number,
+  scale: number[],
+  steps: number,
+  track: PitchTrack = trackPitch(x, start, end, sr)
+): Float32Array {
+  const { period } = track;
+  const ratio = new Float64Array(period.length).fill(1);
+  let r = 1;
+  for (let h = 0; h < period.length; h++) {
+    if (period[h] > 0) {
+      const midi = midiOf(period[h], sr);
+      const base = snapToScale(midi, scale);
+      const target = diatonicShift(base, steps, scale);
+      r = r + 0.35 * (Math.pow(2, (target - base) / 12) - r); // short glide between notes
+    }
+    ratio[h] = r;
+  }
+  return psolaResynth(x, start, end, sr, track, ratio, 'silence');
+}
+
+/**
+ * A natural "double-tracked" copy: a slow random pitch drift of a few cents and a 18-26 ms
+ * timing offset, like a singer recording the same line twice.
+ */
+export function doubleVoice(
+  x: Float32Array,
+  start: number,
+  end: number,
+  sr: number,
+  seed: number,
+  track: PitchTrack = trackPitch(x, start, end, sr)
+): Float32Array {
+  const { hop, period } = track;
+  const ratio = new Float64Array(period.length);
+  const phase = seed * 1.7;
+  const rate = 0.25 + 0.1 * seed;
+  for (let h = 0; h < period.length; h++) {
+    const t = (h * hop) / sr;
+    const cents = 7 * Math.sin(2 * Math.PI * rate * t + phase) + 3 * Math.sin(2 * Math.PI * rate * 2.3 * t + phase * 2);
+    ratio[h] = Math.pow(2, cents / 1200);
+  }
+  const voice = psolaResynth(x, start, end, sr, track, ratio, 'silence');
+  const delay = Math.round(sr * (0.018 + 0.008 * (seed % 2)));
+  const out = new Float32Array(voice.length);
+  out.set(voice.subarray(0, Math.max(0, voice.length - delay)), delay);
   return out;
 }

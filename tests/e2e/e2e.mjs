@@ -271,13 +271,103 @@ await step('idle meter is silent', async () => {
   check('meter reads -∞ when nothing plays (no DC offset)', /-∞/.test(lufs), lufs);
 });
 
+// 7c. Precision slider behaviour (touch + mouse + keyboard)
+await step('precision sliders', async () => {
+  await click(`[...document.querySelectorAll('aside button')].find(b=>/^\\s*Mixer\\s*$/.test(b.textContent))`);
+  await sleep(300);
+  const SEL = `document.querySelector('aside [role=slider][aria-label="Pan"]')`;
+  const info = async () =>
+    evaluate(`(async()=>{const el=${SEL}; el.scrollIntoView({block:'center'}); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))); const r=el.getBoundingClientRect(); return {x:r.left,y:r.top+r.height/2,w:r.width,v:+el.getAttribute('aria-valuenow'),scroll:el.closest('.overflow-y-auto')?.scrollTop ?? 0}})()`);
+  const touch = (type, x, y) =>
+    send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y, id: 1 }] });
+  await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+
+  // 1. vertical swipe that starts on the slider: page scrolls, value unchanged
+  let s = await info();
+  const v0 = s.v;
+  const sc0 = s.scroll;
+  const x = s.x + s.w * 0.8;
+  await touch('touchStart', x, s.y);
+  for (let i = 1; i <= 10; i++) await touch('touchMove', x + i * 0.6, s.y - i * 14);
+  await touch('touchEnd', 0, 0);
+  await sleep(400);
+  let after = await evaluate(`({v:+${SEL}.getAttribute('aria-valuenow'), scroll:${SEL}.closest('.overflow-y-auto')?.scrollTop ?? 0})`);
+  check('touch: vertical swipe over a slider scrolls and does not change it', after.v === v0 && after.scroll !== sc0, `value ${v0} → ${after.v}, scroll ${sc0} → ${after.scroll}`);
+
+  // 2. a tap far from the thumb does nothing
+  s = await info();
+  await touch('touchStart', s.x + s.w * 0.95, s.y);
+  await touch('touchEnd', 0, 0);
+  await sleep(350); // longer than double-tap window
+  after = await info();
+  check('touch: a tap never changes the value', after.v === s.v, `${s.v} → ${after.v}`);
+
+  // 3. sideways drag of 40 px moves relative to the current value (no jump to the finger)
+  s = await info();
+  const startX = s.x + s.w * 0.9; // far from the thumb at centre
+  await touch('touchStart', startX, s.y);
+  for (let i = 1; i <= 8; i++) await touch('touchMove', startX + i * 5, s.y);
+  await touch('touchEnd', 0, 0);
+  await sleep(200);
+  after = await info();
+  const expected = (40 - 6) / s.w * 2; // pan range is 2 (-1..1); first 6 px only start the drag
+  check('touch: sideways drag changes the value relative to where it was', after.v > s.v && Math.abs(after.v - s.v - expected) < 0.12, `${s.v} → ${after.v} (expected ≈ +${expected.toFixed(2)})`);
+  await send('Emulation.setTouchEmulationEnabled', { enabled: false });
+
+  // 4. mouse: Shift-drag is 10x finer than a normal drag
+  const dragBy = async (px, modifiers) => {
+    const r = await info();
+    const thumbX = r.x + ((r.v + 1) / 2) * r.w;
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: thumbX, y: r.y, buttons: 0 });
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: thumbX, y: r.y, button: 'left', clickCount: 1, buttons: 1, modifiers });
+    for (let i = 1; i <= 10; i++) await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: thumbX - (px * i) / 10, y: r.y, button: 'left', buttons: 1, modifiers });
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: thumbX - px, y: r.y, button: 'left', clickCount: 1, buttons: 0, modifiers });
+    await sleep(150);
+    return (await info()).v - r.v;
+  };
+  const normal = await dragBy(60, 0);
+  const fine = await dragBy(60, 8);
+  check('mouse: Shift-drag is ~10x finer', normal < 0 && fine < 0 && Math.abs(fine) < Math.abs(normal) * 0.25, `60 px: normal ${normal.toFixed(2)}, shift ${fine.toFixed(2)}`);
+
+  // 5. type an exact value in the readout (linear slider), and Pan's "25 R" syntax
+  const RSEL = `document.querySelector('aside [role=slider][aria-label="Reverb send"]')`;
+  const typeInto = async (sel, text) => {
+    const can = await evaluate(`(()=>{const b=${sel}.parentElement.querySelector('button'); if(!b || b.disabled) return false; b.click(); return true})()`);
+    if (!can) return false;
+    await sleep(150);
+    const focused = await evaluate(`document.activeElement?.getAttribute('aria-label') || ''`);
+    if (!/value$/.test(focused)) return false;
+    await key('a', 'KeyA', MOD.ctrl);
+    await send('Input.insertText', { text });
+    await key('Enter', 'Enter', 0, '\r');
+    await sleep(250);
+    return true;
+  };
+  const typed = await typeInto(RSEL, '25');
+  const rv = await evaluate(`+${RSEL}.getAttribute('aria-valuenow')`);
+  check('typing an exact value in the readout sets it', typed && Math.abs(rv - 0.25) < 0.001, `reverb send = ${rv}`);
+  const typedPan = await typeInto(SEL, '30 R');
+  const pv = await evaluate(`+${SEL}.getAttribute('aria-valuenow')`);
+  check('Pan accepts "30 R" typed', typedPan && Math.abs(pv - 0.3) < 0.001, `pan = ${pv}`);
+
+  // 6. keyboard nudges by one step (focus via keyboard, not a click: a click on the track jumps)
+  await evaluate(`${RSEL}.focus()`);
+  await key('ArrowLeft', 'ArrowLeft');
+  await sleep(150);
+  const kb = await evaluate(`+${RSEL}.getAttribute('aria-valuenow')`);
+  check('arrow keys nudge by one step', Math.abs(kb - 0.24) < 0.001, `reverb send = ${kb}`);
+  // leave the mix as it was for later steps
+  await typeInto(RSEL, '0');
+  await typeInto(SEL, 'c');
+});
+
 // 8. Clip process slider (commit on release, rendered in worker)
 await step('clip process slider renders in background', async () => {
   const clip = await center(`document.querySelector('[data-clip-id]')`);
   await clickAt(clip.x, clip.y + 10);
   await click(`[...document.querySelectorAll('aside button')].find(b=>/^\\s*Edit\\s*$/.test(b.textContent))`);
   await sleep(400);
-  const slider = await evaluate(`(()=>{const row=[...document.querySelectorAll('aside .py-1\\\\.5')].find(r=>/Normalize peak/.test(r.textContent)); const el=row?.querySelector('input[type=range]'); if(!el) return null; el.scrollIntoView({block:'center'}); const r=el.getBoundingClientRect(); return {x:r.left,y:r.top+r.height/2,w:r.width}})()`);
+  const slider = await evaluate(`(()=>{const el=document.querySelector('aside [role=slider][aria-label="Normalize peak"]'); if(!el) return null; el.scrollIntoView({block:'center'}); const r=el.getBoundingClientRect(); return {x:r.left,y:r.top+r.height/2,w:r.width}})()`);
   if (!slider) throw new Error('Normalize slider not found');
   await drag(slider.x + 2, slider.y, slider.x + slider.w * 0.8, slider.y, 10);
   await sleep(150);
@@ -324,6 +414,34 @@ await step('WAV export produces a valid file', async () => {
   check('WAV export produces a valid 16-bit stereo file', info.riff === 'RIFF' && info.wave === 'WAVE' && info.bits === 16 && info.channels === 2 && seconds > 5, `${info.name}, ${seconds.toFixed(1)} s`);
   await sleep(500);
   check('export shows a success toast', (await evaluate(`[...window.__toasts]`)).some((t) => /Exported/.test(t)));
+});
+
+await step('stem export at 48 kHz', async () => {
+  await evaluate(`window.__exports=[]`);
+  await click(`document.querySelector('button[aria-label="Export audio"]')`);
+  await sleep(300);
+  await click(`[...document.querySelectorAll('[role=menu] [role=radio]')].find(b=>b.textContent.trim()==='Stems (ZIP)')`);
+  await click(`[...document.querySelectorAll('[role=menu] [role=radio]')].find(b=>b.textContent.trim()==='48k')`);
+  await sleep(150);
+  await click(byText('[role=menu] button', '/WAV · 24-bit/'));
+  const t0 = Date.now();
+  while (Date.now() - t0 < 90000 && !(await evaluate(`window.__exports.length`))) await sleep(300);
+  // Read the ZIP's central directory, then each WAV header inside it
+  const zip = await evaluate(`(async()=>{const b=window.__exports[0]; if(!b) return null; const u=new Uint8Array(await b.arrayBuffer()); const v=new DataView(u.buffer); const e=u.length-22; if(v.getUint32(e,true)!==0x06054b50) return {bad:'no EOCD'}; const n=v.getUint16(e+10,true); let cd=v.getUint32(e+16,true); const files=[]; for(let i=0;i<n;i++){const nl=v.getUint16(cd+28,true); const size=v.getUint32(cd+24,true); const lo=v.getUint32(cd+42,true); const name=new TextDecoder().decode(u.subarray(cd+46,cd+46+nl)); const d=lo+30+v.getUint16(lo+26,true); files.push({name, size, riff:String.fromCharCode(...u.subarray(d,d+4)), rate:v.getUint32(d+24,true), bits:v.getUint16(d+34,true), frames:v.getUint32(d+40,true)/(v.getUint16(d+22,true)*v.getUint16(d+34,true)/8)}); cd+=46+nl;} return {name:window.__dlName, type:b.type, files}})()`);
+  console.log(`      (stems took ${((Date.now() - t0) / 1000).toFixed(1)} s)`, JSON.stringify(zip));
+  if (!zip || zip.bad) throw new Error('no stem zip: ' + JSON.stringify(zip));
+  const expected = await evaluate(`(async()=>{const e=(await import(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.includes('/src/audio/audioEngine.ts')).pop())).audioEngine; return e.lastSyncedTracks.filter(t=>!t.muted).length})()`);
+  const ok = zip.files.length === expected && zip.files.every((f) => f.riff === 'RIFF' && f.rate === 48000 && f.bits === 24);
+  const sameLength = new Set(zip.files.map((f) => f.frames)).size === 1;
+  check('stems export one 24-bit / 48 kHz WAV per track in a ZIP', ok && /_stems\.zip$/.test(zip.name), `${zip.name}: ${zip.files.map((f) => f.name).join(', ')}`);
+  check('all stems have the same length (they line up)', sameLength, `${zip.files[0]?.frames} frames`);
+  // back to the defaults for the rest of the run
+  await click(`document.querySelector('button[aria-label="Export audio"]')`);
+  await sleep(300);
+  await click(`[...document.querySelectorAll('[role=menu] [role=radio]')].find(b=>b.textContent.trim()==='Full mix')`);
+  await click(`[...document.querySelectorAll('[role=menu] [role=radio]')].find(b=>b.textContent.trim()==='44.1k')`);
+  await key('Escape', 'Escape');
+  await sleep(200);
 });
 
 // 10b. Multi-select, group drag, copy/paste, overlap resolution
@@ -422,11 +540,11 @@ await step('fx returns and sends', async () => {
   await sleep(300);
   const hasPanel = await evaluate(`/FX returns/.test(document.querySelector('aside').innerText)`);
   check('Mixer shows the shared FX returns', hasPanel);
-  const slider = await evaluate(`(()=>{const row=[...document.querySelectorAll('aside .py-1\\\\.5')].find(r=>/Reverb send/.test(r.textContent)); const el=row?.querySelector('input[type=range]'); if(!el) return null; el.scrollIntoView({block:'center'}); const r=el.getBoundingClientRect(); return {x:r.left,y:r.top+r.height/2,w:r.width}})()`);
+  const slider = await evaluate(`(()=>{const el=document.querySelector('aside [role=slider][aria-label="Reverb send"]'); if(!el) return null; el.scrollIntoView({block:'center'}); const r=el.getBoundingClientRect(); return {x:r.left,y:r.top+r.height/2,w:r.width}})()`);
   if (!slider) throw new Error('no reverb send slider');
   await drag(slider.x + 2, slider.y, slider.x + slider.w * 0.5, slider.y, 8);
   await sleep(300);
-  const txt = await evaluate(`[...document.querySelectorAll('aside .py-1\\\\.5')].find(r=>/Reverb send/.test(r.textContent)).textContent`);
+  const txt = await evaluate(`document.querySelector('aside [role=slider][aria-label="Reverb send"]').getAttribute('aria-valuetext')`);
   const pct = +(/(\d+)%/.exec(txt)?.[1] ?? 0);
   check('a track reverb send can be set', pct >= 30 && pct <= 70, txt.trim());
   const delayButton = await center(`[...document.querySelectorAll('[role=radio]')].find(b=>b.textContent.trim()==='1/4')`);
@@ -435,6 +553,173 @@ await step('fx returns and sends', async () => {
   const ms = await evaluate(`/(\\d+) ms @/.exec(document.querySelector('aside').innerText)?.[1]`);
   check('delay syncs to tempo (1/4 note at 95 BPM = 632 ms)', ms === '632', `${ms} ms`);
   await shot('09-returns');
+});
+
+await step('compressor & ducking', async () => {
+  const engine = `(await import(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.includes('/src/audio/audioEngine.ts')).pop())).audioEngine`;
+  // Mixer: duck the first track under the second
+  await click(`[...document.querySelectorAll('aside button')].find(b=>/^\\s*Mixer\\s*$/.test(b.textContent))`);
+  await sleep(300);
+  const keyName = await evaluate(`(()=>{const s=document.querySelector('aside select[id^=duck-]'); const opt=s.options[1]; const set=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; set.call(s,opt.value); s.dispatchEvent(new Event('change',{bubbles:true})); return opt.textContent})()`);
+  await sleep(400);
+  const wired = await evaluate(`(async()=>{const e=${engine}; return e.duckWired.size})()`);
+  const amount = await evaluate(`document.querySelector('aside [role=slider][aria-label="Duck amount"]')?.getAttribute('aria-valuetext')`);
+  check('a track can duck under another', wired === 1 && /-6\.0 dB/.test(amount || ''), `key ${keyName}, wired ${wired}, ${amount}`);
+  await evaluate(`document.querySelector('aside select[id^=duck-]').scrollIntoView({block:'center'})`);
+  await shot('10-ducking');
+  // Off again
+  await evaluate(`(()=>{const s=document.querySelector('aside select[id^=duck-]'); const set=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; set.call(s,''); s.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+  await sleep(300);
+  const unwired = await evaluate(`(async()=>{const e=${engine}; return e.duckWired.size})()`);
+  check('ducking can be switched off', unwired === 0, `wired ${unwired}`);
+
+  // FX: compressor on with a low threshold -> the gain-reduction meter moves while playing
+  await click(`[...document.querySelectorAll('aside button')].find(b=>/^\\s*FX\\s*$/.test(b.textContent) || /^\\s*Effects\\s*$/.test(b.textContent))`);
+  await sleep(300);
+  const sw = await evaluate(`(()=>{const sec=[...document.querySelectorAll('aside section')].find(e=>e.querySelector(':scope > [role=button] > span')?.textContent.trim()==='Compressor'); const s=sec?.querySelector('[role=switch]'); if(!s) return null; s.scrollIntoView({block:'center'}); return s.getAttribute('aria-checked')})()`);
+  if (sw === null) throw new Error('compressor switch not found');
+  if (sw === 'false') await evaluate(`[...document.querySelectorAll('aside section')].find(e=>e.querySelector(':scope > [role=button] > span')?.textContent.trim()==='Compressor').querySelector('[role=switch]').click()`);
+  await sleep(300);
+  // open the section if collapsed
+  const hasMeter = await evaluate(`!!document.querySelector('aside [role=meter][aria-label="Gain reduction"]')`);
+  if (!hasMeter) await evaluate(`[...document.querySelectorAll('aside section > [role=button]')].find(b=>/^Compressor/.test(b.textContent.trim())).click()`);
+  await sleep(300);
+  const th = await evaluate(`(()=>{const el=document.querySelector('aside [role=slider][aria-label="Threshold"]'); el.scrollIntoView({block:'center'}); el.focus(); return el.getAttribute('aria-valuetext')})()`);
+  await key('Home', 'Home');
+  await sleep(200);
+  const th2 = await evaluate(`document.querySelector('aside [role=slider][aria-label="Threshold"]').getAttribute('aria-valuetext')`);
+  await key(' ', 'Space', 0, ' ');
+  await sleep(2500);
+  let minGr = 0;
+  for (let i = 0; i < 10; i++) {
+    const v = await evaluate(`+document.querySelector('aside [role=meter][aria-label="Gain reduction"]').getAttribute('aria-valuenow')`);
+    minGr = Math.min(minGr, v);
+    await sleep(100);
+  }
+  await shot('11-compressor');
+  await key(' ', 'Space', 0, ' ');
+  await sleep(300);
+  check('gain-reduction meter shows compression while playing', minGr <= -3, `threshold ${th} -> ${th2}, GR ${minGr} dB`);
+  const mix = await evaluate(`!!document.querySelector('aside [role=slider][aria-label="Mix (parallel)"]')`);
+  check('compressor has a parallel Mix control', mix);
+  // leave the project as it was (threshold, and the switch if this step turned it on)
+  for (let i = 0; i < (sw === 'false' ? 2 : 1); i++) {
+    await key('z', 'KeyZ', MOD.ctrl);
+    await sleep(250);
+  }
+});
+
+await step('parametric EQ', async () => {
+  const engine = `(await import(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.includes('/src/audio/audioEngine.ts')).pop())).audioEngine`;
+  const midNode = `(async()=>{const e=${engine}; const id=[...e.trackNodes.keys()].find(k=>document.querySelector('aside').innerText.includes(e.lastSyncedTracks.find(t=>t.id===k)?.name)); const n=e.trackNodes.get(id).eqBands[3]; return {type:n.type, gain:+n.gain.value.toFixed(2), freq:Math.round(n.frequency.value)}})()`;
+  const handle = (i) => `(()=>{const el=document.querySelector('aside [data-eq-band="${i}"]'); if(!el) return null; const r=el.getBoundingClientRect(); return {x:r.left+r.width/2,y:r.top+r.height/2,label:el.getAttribute('aria-label')}})()`;
+  const open = await evaluate(`!!document.querySelector('aside [data-eq-band]')`);
+  if (!open) await evaluate(`[...document.querySelectorAll('aside section > [role=button]')].find(b=>/^Equalizer/.test(b.textContent.trim())).click()`);
+  await sleep(300);
+  await evaluate(`document.querySelector('aside [aria-label="EQ curve"]').scrollIntoView({block:'center'})`);
+  await sleep(200);
+  let h = await evaluate(handle(3));
+  if (!h) throw new Error('EQ handles not found');
+  // Touch: a tap only selects (no change); vertical swipe on the graph (not a handle) changes nothing
+  await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+  const touch = async (type, x, y) => send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] });
+  const before = await evaluate(handle(3));
+  await touch('touchStart', h.x, h.y); await sleep(40); await touch('touchMove', h.x + 1, h.y - 1); await sleep(40); await touch('touchEnd');
+  await sleep(200);
+  const afterTap = await evaluate(handle(3));
+  check('tapping an EQ handle selects it without changing it', afterTap.label === before.label, afterTap.label);
+  // Touch drag the handle up 40 px -> gain rises
+  await touch('touchStart', h.x, h.y);
+  for (let k = 1; k <= 8; k++) { await touch('touchMove', h.x, h.y - k * 5); await sleep(16); }
+  await touch('touchEnd');
+  await send('Emulation.setTouchEmulationEnabled', { enabled: false });
+  await sleep(300);
+  const afterTouch = await evaluate(midNode);
+  check('dragging an EQ handle by touch raises the band', afterTouch.gain > 3, JSON.stringify(afterTouch));
+  // Mouse: drag right one octave-ish, Shift-drag for fine changes
+  h = await evaluate(handle(3));
+  await drag(h.x, h.y, h.x + 60, h.y, 8);
+  await sleep(300);
+  const afterMouse = await evaluate(midNode);
+  check('dragging an EQ handle with the mouse moves its frequency', afterMouse.freq > afterTouch.freq * 1.5, `${afterTouch.freq} -> ${afterMouse.freq} Hz`);
+  // Keyboard: focused handle, ArrowDown = -0.5 dB
+  await evaluate(`document.querySelector('aside [data-eq-band="3"]').focus()`);
+  await key('ArrowDown', 'ArrowDown');
+  await sleep(250);
+  const afterKey = await evaluate(midNode);
+  check('arrow keys nudge the focused band', Math.abs(afterMouse.gain - 0.5 - afterKey.gain) < 0.06, `${afterMouse.gain} -> ${afterKey.gain} dB`);
+  // Low cut: switch on via tab + switch -> node becomes a highpass
+  await click(`document.querySelector('aside [role=tab][title="Low cut"]')`);
+  await sleep(150);
+  await click(`document.querySelector('aside [role=switch][aria-label="Low cut on"]')`);
+  await sleep(250);
+  const hp = await evaluate(`(async()=>{const e=${engine}; const n=[...e.trackNodes.values()].map(t=>t.eqBands[0]).find(n=>n.type==='highpass'); return !!n})()`);
+  check('a low cut band can be switched on', hp);
+  // Analyzer draws while playing
+  await key(' ', 'Space', 0, ' ');
+  await sleep(1200);
+  const live = await evaluate(`(async()=>{const e=${engine}; const sp=e.spectrum; return sp ? Math.max(...sp.data) : null})()`);
+  await shot('12-eq');
+  await key(' ', 'Space', 0, ' ');
+  await sleep(300);
+  check('EQ analyzer shows the track spectrum while playing', live !== null && live > -90, `peak bin ${live?.toFixed?.(1)} dB`);
+  // Back to flat via the header button, then undo history is intact
+  await click(`[...document.querySelectorAll('aside section > [role=button] button')].find(b=>b.textContent.trim()==='Flat')`);
+  await sleep(300);
+  const flat = await evaluate(midNode);
+  check('"Flat" resets the EQ', flat.gain === 0 && !(await evaluate(`(async()=>{const e=${engine}; return [...e.trackNodes.values()].some(t=>t.eqBands[0].type==='highpass')})()`)), JSON.stringify(flat));
+});
+
+await step('reference track A/B', async () => {
+  const engine = `(await import(performance.getEntriesByType('resource').map(e=>e.name).filter(u=>u.includes('/src/audio/audioEngine.ts')).pop())).audioEngine`;
+  // 6 s stereo 16-bit WAV: 220 Hz + 2.2 kHz tones at a known level
+  const sr = 44100, n = sr * 6, wav = Buffer.alloc(44 + n * 4);
+  wav.write('RIFF', 0); wav.writeUInt32LE(36 + n * 4, 4); wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(2, 22); wav.writeUInt32LE(sr, 24);
+  wav.writeUInt32LE(sr * 4, 28); wav.writeUInt16LE(4, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(n * 4, 40);
+  for (let i = 0; i < n; i++) {
+    const v = Math.round(32767 * (0.25 * Math.sin(2 * Math.PI * 220 * i / sr) + 0.1 * Math.sin(2 * Math.PI * 2200 * i / sr)));
+    wav.writeInt16LE(v, 44 + i * 4); wav.writeInt16LE(v, 46 + i * 4);
+  }
+  const refPath = join(dlDir, '..', 'reference-song.wav');
+  writeFileSync(refPath, wav);
+
+  await click(`[...document.querySelectorAll('aside button')].find(b=>/^\\s*Mixer\\s*$/.test(b.textContent))`);
+  await sleep(300);
+  const { root } = await send('DOM.getDocument', { depth: -1 }).then((r) => r.result);
+  const { nodeId } = (await send('DOM.querySelector', { nodeId: root.nodeId, selector: 'input[aria-label="Reference audio file"]' })).result;
+  if (!nodeId) throw new Error('reference file input not found');
+  await send('DOM.setFileInputFiles', { nodeId, files: [refPath] });
+  let msg = '';
+  for (let i = 0; i < 40 && !/to match your mix/.test(msg); i++) {
+    await sleep(250);
+    msg = await evaluate(`document.querySelector('aside [aria-live=polite]')?.textContent || ''`);
+  }
+  const name = await evaluate(`/reference-song/.test(document.querySelector('aside').innerText)`);
+  check('a reference song can be loaded and is level-matched', name && /turned (down|up) [\d.]+ dB to match your mix/.test(msg), msg);
+  const g = await evaluate(`(async()=>{const e=${engine}; return e.refGainDb})()`);
+  const shown = +(/([\d.]+) dB to match/.exec(msg)?.[1] ?? NaN);
+  check('the reference gain applied in the engine is the one shown', Math.abs(Math.abs(g) - shown) < 0.06, `engine ${g.toFixed(2)} dB, shown ${shown}`);
+
+  await evaluate(`document.querySelector('aside [role=radiogroup][aria-label=Monitor]').scrollIntoView({block:'center'})`);
+  await click(`[...document.querySelectorAll('aside [role=radio]')].find(b=>/Reference/.test(b.textContent))`);
+  await key(' ', 'Space', 0, ' ');
+  await sleep(1500);
+  const st = await evaluate(`(async()=>{const e=${engine}; return {nodes:e.refNodes.size, mix:+e.abMix.gain.value.toFixed(3), ref:+e.refBus.gain.value.toFixed(3), pos:e.getTimelinePosition()}})()`);
+  const pill = await evaluate(`/Hearing reference/.test(document.body.innerText)`);
+  await shot('13-reference');
+  check('B plays the reference in place of the mix', st.nodes > 0 && st.mix < 0.01 && st.ref > 0 && pill, JSON.stringify(st));
+  await click(`[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Back to mix')`);
+  await sleep(300);
+  const back = await evaluate(`(async()=>{const e=${engine}; return {mix:+e.abMix.gain.value.toFixed(3), ref:+e.refBus.gain.value.toFixed(3)}})()`);
+  const pillGone = await evaluate(`!/Hearing reference/.test(document.body.innerText)`);
+  check('"Back to mix" returns to A', back.mix > 0.95 && back.ref < 0.01 && pillGone, JSON.stringify(back));
+  await key(' ', 'Space', 0, ' ');
+  await sleep(300);
+  await click(`document.querySelector('aside [aria-label="Remove reference"]')`);
+  await sleep(200);
+  const removed = await evaluate(`(async()=>{const e=${engine}; return !e.hasReference()})()`);
+  check('the reference can be removed', removed);
 });
 
 // 11. Recording with the fake microphone (count-in on)

@@ -54,7 +54,40 @@ export function getExportFormat(id: ExportFormatId): ExportFormatOption {
   return EXPORT_FORMATS.find((f) => f.id === id) ?? EXPORT_FORMATS[0];
 }
 
-/** Encodes a rendered AudioBuffer as a PCM WAV file (16 or 24 bits per sample). */
+export const EXPORT_SAMPLE_RATES = [44100, 48000, 96000] as const;
+export type ExportSampleRate = (typeof EXPORT_SAMPLE_RATES)[number];
+
+/** MP3 (MPEG-1 Layer III) tops out at 48 kHz. */
+export const maxSampleRateFor = (id: ExportFormatId): ExportSampleRate => (id.startsWith('mp3') ? 48000 : 96000);
+
+/** Small fast PRNG (mulberry32) so dither is reproducible per export. */
+function rng(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Float -> 16-bit with TPDF dither (+-1 LSB triangular noise). Without dither, quiet passages
+ * and fade-outs turn into gritty, signal-dependent distortion; with it they become a smooth,
+ * inaudible noise floor at about -96 dBFS.
+ */
+export function quantize16(samples: Float32Array, seed = 1): Int16Array {
+  const rand = rng(seed);
+  const out = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i] * 32767 + (rand() - rand());
+    out[i] = Math.max(-32768, Math.min(32767, Math.round(v)));
+  }
+  return out;
+}
+
+/** Encodes a rendered AudioBuffer as a PCM WAV file (16-bit dithered, or 24-bit). */
 function encodeWav(buffer: AudioBuffer, bitDepth: 16 | 24): Blob {
   const numChannels = buffer.numberOfChannels;
   const bytesPerSample = bitDepth / 8;
@@ -82,14 +115,15 @@ function encodeWav(buffer: AudioBuffer, bitDepth: 16 | 24): Blob {
 
   const channels: Float32Array[] = [];
   for (let ch = 0; ch < numChannels; ch++) channels.push(buffer.getChannelData(ch));
+  const pcm16 = bitDepth === 16 ? channels.map((c, ch) => quantize16(c, ch + 1)) : null;
 
   let offset = 44;
   for (let i = 0; i < buffer.length; i++) {
     for (let ch = 0; ch < numChannels; ch++) {
-      const s = Math.max(-1, Math.min(1, channels[ch][i]));
-      if (bitDepth === 16) {
-        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      if (pcm16) {
+        view.setInt16(offset, pcm16[ch][i], true);
       } else {
+        const s = Math.max(-1, Math.min(1, channels[ch][i]));
         const v = Math.round(s < 0 ? s * 0x800000 : s * 0x7fffff);
         view.setUint8(offset, v & 0xff);
         view.setUint8(offset + 1, (v >> 8) & 0xff);
@@ -102,22 +136,13 @@ function encodeWav(buffer: AudioBuffer, bitDepth: 16 | 24): Blob {
   return new Blob([out], { type: 'audio/wav' });
 }
 
-function floatToInt16(samples: Float32Array): Int16Array {
-  const out = new Int16Array(samples.length);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
-}
-
 /** Encodes an AudioBuffer as MP3. The encoder is loaded on demand to keep the app bundle small. */
 async function encodeMp3(buffer: AudioBuffer, kbps: number): Promise<Blob> {
   const { Mp3Encoder } = await import('@breezystack/lamejs');
   const channels = Math.min(2, buffer.numberOfChannels);
   const encoder = new Mp3Encoder(channels, buffer.sampleRate, kbps);
-  const left = floatToInt16(buffer.getChannelData(0));
-  const right = channels > 1 ? floatToInt16(buffer.getChannelData(1)) : undefined;
+  const left = quantize16(buffer.getChannelData(0), 1);
+  const right = channels > 1 ? quantize16(buffer.getChannelData(1), 2) : undefined;
 
   const blockSize = 1152 * 16;
   const parts: Uint8Array[] = [];

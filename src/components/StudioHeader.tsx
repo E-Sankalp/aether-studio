@@ -20,7 +20,7 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { AetherLogo, AetherMark } from './AetherLogo';
-import { ExportMenu } from './ExportMenu';
+import { ExportMenu, ExportOptions } from './ExportMenu';
 import { VisualizerDock } from './VisualizerDock';
 import { ExportFormatId } from '../audio/audioEncoders';
 import { micLevelStore, playheadStore, useLiveStore } from '../utils/liveStore';
@@ -318,7 +318,7 @@ export interface StudioHeaderProps extends TransportProps {
   onZoomIn: () => void;
   onZoomOut: () => void;
   isExporting: boolean;
-  onExport: (format: ExportFormatId) => void;
+  onExport: (format: ExportFormatId, options: ExportOptions) => void;
   onShowShortcuts: () => void;
 }
 

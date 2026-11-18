@@ -44,6 +44,7 @@ export const EMPTY_METERS: MeterLevels = {
   masterRmsDb: -60,
   phaseCorrelation: 1,
   trackLevels: {},
+  trackReduction: {},
 };
 
 /** Timeline playhead in seconds. */

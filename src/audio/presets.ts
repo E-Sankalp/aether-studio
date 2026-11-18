@@ -156,5 +156,7 @@ export const MUSIC_PRESETS: EffectPreset[] = [
 
 export const applyPresetValues = (preset: EffectPreset): TrackEffects => ({
   ...DEFAULT_EFFECTS,
+  // Presets are written for the 3-band EQ fields: drop any parametric EQ so they take effect
+  eq: undefined,
   ...preset.values,
 });

@@ -70,4 +70,51 @@ class AetherDeEsser extends AudioWorkletProcessor {
   }
 }
 registerProcessor('aether-deesser', AetherDeEsser);
+
+/*
+ * Ducking envelope: listens to a "key" track (e.g. the vocal) and outputs a gain (1 = no
+ * ducking) that drives the ducked track's GainNode.gain directly, sample-accurately. Reduction
+ * rises smoothly from 0 to amountDb as the key goes from threshold to threshold + 12 dB.
+ */
+class AetherDuckEnv extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [
+      { name: 'amountDb', defaultValue: 6, minValue: 0, maxValue: 30, automationRate: 'k-rate' },
+      { name: 'thresholdDb', defaultValue: -40, minValue: -80, maxValue: 0, automationRate: 'k-rate' },
+    ];
+  }
+  constructor() {
+    super();
+    this.env = 0;
+    this.g = 1;
+    // Level detector: fast both ways, so silence is recognised within ~0.1 s of the key stopping
+    // (a slow amplitude release needed ~30 dB of decay and kept the music ducked for 0.5 s)
+    this.att = Math.exp(-1 / (0.005 * sampleRate));
+    this.rel = Math.exp(-1 / (0.03 * sampleRate));
+    // Gain smoothing: duck in quickly (10 ms), come back up gently (200 ms) - no pumping
+    this.gAtt = Math.exp(-1 / (0.01 * sampleRate));
+    this.gRel = Math.exp(-1 / (0.2 * sampleRate));
+  }
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    const out = outputs[0][0];
+    if (!out) return true;
+    const amount = parameters.amountDb[0];
+    const thr = parameters.thresholdDb[0];
+    const chs = input ? input.length : 0;
+    for (let i = 0; i < out.length; i++) {
+      let a = 0;
+      for (let c = 0; c < chs; c++) a = Math.max(a, Math.abs(input[c][i]));
+      this.env = a > this.env ? this.att * this.env + (1 - this.att) * a : this.rel * this.env + (1 - this.rel) * a;
+      const db = 20 * Math.log10(this.env + 1e-9);
+      const t = Math.max(0, Math.min(1, (db - thr) / 12));
+      const target = Math.pow(10, (-amount * t * t * (3 - 2 * t)) / 20);
+      const k = target < this.g ? this.gAtt : this.gRel;
+      this.g = k * this.g + (1 - k) * target;
+      out[i] = this.g;
+    }
+    return true;
+  }
+}
+registerProcessor('aether-duck-env', AetherDuckEnv);
 `;

@@ -3,7 +3,7 @@
  * operating on plain Float32Array channels so nothing blocks the UI thread.
  */
 import type { ClipProcessSettings } from '../../types/audio';
-import { deEss, psolaAutotune, spectralDenoise } from './vocalDsp';
+import { deEss, doubleVoice, harmonyVoice, psolaAutotune, spectralDenoise, trackPitch } from './vocalDsp';
 
 export interface ClipRenderRequest {
   channels: Float32Array[];
@@ -241,24 +241,40 @@ export function renderClipChannels(req: ClipRenderRequest): Float32Array[] {
     }
   }
 
-  // 4. 3-Part Vocal Harmony (0..100%)
+  // 4. Harmony / double voices (0..100%): real PSOLA voices that follow the key, mixed in stereo
+  //    (a mono take becomes stereo: lead in the centre, voices left/right)
   if (processes.harmony > 0) {
     const amt = Math.min(1, processes.harmony / 100);
-    const grain = Math.floor(sr * 0.045);
-    const ratioThird = Math.pow(2, 4 / 12);
-    const ratioFifth = Math.pow(2, 7 / 12);
-    channels.forEach((data, ch) => {
-      const orig = data.slice(startSample, endSample);
-      const ratio = ch === 0 ? ratioThird : ratioFifth;
+    const style = processes.harmonyStyle ?? 'choir';
+    const mono = new Float32Array(length);
+    for (const ch of channels) for (let i = startSample; i < endSample; i++) mono[i] += ch[i] / channels.length;
+    const track = trackPitch(mono, startSample, endSample, sr);
+    const voice = (steps: number) => harmonyVoice(mono, startSample, endSample, sr, scaleSemitones, steps, track);
+    // [voice, pan -1..1]
+    const voices: [Float32Array, number][] =
+      style === 'double'
+        ? [
+            [doubleVoice(mono, startSample, endSample, sr, 1, track), -0.85],
+            [doubleVoice(mono, startSample, endSample, sr, 2, track), 0.85],
+          ]
+        : style === 'choir'
+        ? [
+            [voice(2), -0.6],
+            [voice(4), 0.6],
+          ]
+        : [[voice({ thirdUp: 2, thirdDown: -2, fifth: 4, octaveDown: -7 }[style]), 0]];
+    // Harmonies sit ~5 dB under the lead at 100 %; doubles a little lower
+    const level = (style === 'double' ? 0.45 : 0.55) * amt;
+    if (channels.length === 1) channels.push(new Float32Array(channels[0]));
+    const [L, R] = channels;
+    for (const [v, pan] of voices) {
+      const gl = level * Math.sqrt((1 - pan) / 2) * Math.SQRT2;
+      const gr = level * Math.sqrt((1 + pan) / 2) * Math.SQRT2;
       for (let i = 0; i < count; i++) {
-        const grainIdx = Math.floor(i / grain) * grain;
-        const posInGrain = i - grainIdx;
-        const win = Math.sin((Math.PI * posInGrain) / grain);
-        const shiftPos = Math.min(count - 1, Math.floor(grainIdx + posInGrain * ratio));
-        const harmonySample = orig[shiftPos] * win * (0.65 * amt);
-        data[startSample + i] = Math.tanh(orig[i] * (1 - amt * 0.18) + harmonySample);
+        L[startSample + i] += v[i] * gl;
+        R[startSample + i] += v[i] * gr;
       }
-    });
+    }
   }
 
   // 5. Peak Normalize (0..100%)

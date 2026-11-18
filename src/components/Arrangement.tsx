@@ -349,6 +349,8 @@ export const Arrangement: React.FC<ArrangementProps> = ({
                       step={0.01}
                       defaultValue={0.85}
                       className="flex-1 min-w-0 ml-0.5"
+                      ariaLabel={`${track.name} volume`}
+                      format={(v) => (v <= 0.001 ? '-∞ dB' : `${(20 * Math.log10(v)).toFixed(1)} dB`)}
                       onChange={(v) => onUpdateTrack(track.id, { volume: v })}
                     />
                   </div>

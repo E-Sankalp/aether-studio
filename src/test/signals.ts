@@ -59,3 +59,15 @@ export function harmonicTone(
   }
   return x;
 }
+
+/** Voice-like tone: natural 1/h harmonic rolloff with a formant boost (strong fundamental). */
+export function voiceTone(f0: number, seconds: number, formantHz = 1000, sr = SR): Float32Array {
+  const n = Math.round(seconds * sr);
+  const x = new Float32Array(n);
+  for (let h = 1; h * f0 < Math.min(6000, sr / 2); h++) {
+    const f = h * f0;
+    const amp = 0.25 / h + 0.2 * Math.exp(-(((f - formantHz) / 200) ** 2));
+    for (let i = 0; i < n; i++) x[i] += Math.sin((2 * Math.PI * f * i) / sr) * amp;
+  }
+  return x;
+}

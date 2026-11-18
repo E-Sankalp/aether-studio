@@ -15,6 +15,7 @@ import {
 import { VOCAL_SCALES } from './presets';
 import { saveBufferToStorage } from '../utils/projectStorage';
 import {
+  analyzeBuffer,
   applyMasterChain,
   createMasterChain,
   DEFAULT_MASTER,
@@ -25,6 +26,7 @@ import { ClipRenderRequest, isDefaultProcesses, renderClipChannels } from './dsp
 import { createReturnBuses, mulberry32, ReturnBuses } from './fxReturns';
 import { scheduleAutomation, valueAt } from './automation';
 import { DEESSER_WORKLET_SOURCE } from './dsp/deEsserWorklet';
+import { bandActive, EQ_BAND_COUNT, nodeQ, resolveEq } from './eq';
 
 interface TrackGraphNodes {
   input: GainNode;
@@ -37,11 +39,20 @@ interface TrackGraphNodes {
   harshCutFilter: BiquadFilterNode;
   vocalWarmthFilter: BiquadFilterNode;
   autoPitchFormant: BiquadFilterNode;
-  eqLow: BiquadFilterNode;
-  eqMid: BiquadFilterNode;
-  eqHigh: BiquadFilterNode;
+  /** Parametric EQ: six biquads in series (see eq.ts) */
+  eqBands: BiquadFilterNode[];
+  /** High-shelf colour from Voice softener / Auto-pitch (separate from the user's EQ) */
+  toneShelf: BiquadFilterNode;
   driveShaper: WaveShaperNode;
   compressor: DynamicsCompressorNode;
+  /** Parallel compression: delay-matched dry path + wet level, summed into compSum */
+  compWet: GainNode;
+  compDry: GainNode;
+  compDryDelay: DelayNode;
+  /** Fan-out point after the dynamics stage (feeds dry/processed, delay, reverb, harmony) */
+  compSum: GainNode;
+  /** Ducking gain (driven by the key track's envelope when ducked) */
+  duckGain: GainNode;
   processedDryGain: GainNode;
   wetMasterGain: GainNode;
   // Vocal Harmony / Choir Stereo Engine
@@ -70,6 +81,13 @@ interface TrackGraphNodes {
   sendDelay: GainNode;
   analyser: AnalyserNode;
   currentReverbDecay: number;
+}
+
+export interface RenderOptions {
+  /** Output sample rate (default 44100) */
+  sampleRate?: number;
+  /** Render a single track (a stem), unmastered */
+  onlyTrackId?: string;
 }
 
 interface ActiveClipNode {
@@ -177,6 +195,19 @@ export class StudioAudioEngine {
   private dspReady = new WeakSet<BaseAudioContext>();
   private dspLoading = new WeakMap<BaseAudioContext, Promise<void>>();
   private lastSyncedTracks: AudioTrack[] = [];
+  // Ducking (live graph): envelope per key track, and which key each ducked track follows
+  private duckEnvs = new Map<string, AudioWorkletNode>();
+  private duckWired = new Map<string, string>();
+  // EQ analyzer: one shared analyser, tapped from the track being edited
+  // Reference track (A/B): plays in sync with the timeline, outside the mix and master chain
+  private refBuffer: AudioBuffer | null = null;
+  private refBus: GainNode | null = null;
+  /** Mix level at the monitor output: 1 = hearing the mix (A), 0 = hearing the reference (B) */
+  private abMix: GainNode | null = null;
+  private refActive = false;
+  private refGainDb = 0;
+  private refNodes = new Set<{ source: AudioBufferSourceNode; gain: GainNode }>();
+  private spectrum: { analyser: AnalyserNode; source: AudioNode; trackId: string; data: Float32Array } | null = null;
   private returns: FxReturns = DEFAULT_RETURNS;
   private masterSettings: MasterSettings = DEFAULT_MASTER;
   private masterPreviewMakeupDb = 0;
@@ -250,10 +281,18 @@ export class StudioAudioEngine {
       this.rightAnalyser.fftSize = 512;
 
       this.masterGain.connect(this.masterChain.input);
-      this.masterChain.output.connect(this.masterAnalyser);
+      // A/B monitor switch: the mix and the reference meet after the master chain, so meters and
+      // the analyzer always show what you hear
+      this.abMix = this.ctx.createGain();
+      this.refBus = this.ctx.createGain();
+      this.refBus.gain.value = 0;
+      this.masterChain.output.connect(this.abMix);
+      this.abMix.connect(this.masterAnalyser);
+      this.refBus.connect(this.masterAnalyser);
       this.masterAnalyser.connect(this.ctx.destination);
 
-      this.masterChain.output.connect(this.splitter);
+      this.abMix.connect(this.splitter);
+      this.refBus.connect(this.splitter);
       this.splitter.connect(this.leftAnalyser, 0);
       this.splitter.connect(this.rightAnalyser, 1);
     }
@@ -287,6 +326,92 @@ export class StudioAudioEngine {
    * Applies mastering settings to the live master bus. `previewMakeupDb` is the loudness gain the
    * export would apply (from the last analysis), so playback roughly matches the exported master.
    */
+  /* ------------------------------ reference track ----------------------------- */
+
+  /**
+   * Loads a reference song (any format the browser decodes). Returns its loudness so the UI can
+   * level-match it to the mix. Playback restarts in place if the transport is running.
+   */
+  public async loadReference(data: ArrayBuffer): Promise<{ duration: number; lufs: number; truePeakDb: number }> {
+    const ctx = this.getContext();
+    const buffer = await ctx.decodeAudioData(data);
+    this.refBuffer = buffer;
+    const { lufs, truePeakDb } = analyzeBuffer(buffer);
+    this.restartInPlace();
+    return { duration: buffer.duration, lufs, truePeakDb };
+  }
+
+  public clearReference(): void {
+    this.refBuffer = null;
+    this.setReferenceActive(false);
+    for (const n of this.refNodes) {
+      try {
+        n.source.stop();
+        n.source.disconnect();
+      } catch {}
+    }
+    this.refNodes.clear();
+  }
+
+  public hasReference(): boolean {
+    return this.refBuffer !== null;
+  }
+
+  /** Reference playback gain in dB (loudness matching). */
+  public setReferenceGain(db: number): void {
+    this.refGainDb = Math.max(-40, Math.min(24, db));
+    this.applyAb();
+  }
+
+  /** true = hear the reference (B), false = hear the mix (A). Crossfades in ~30 ms. */
+  public setReferenceActive(on: boolean): void {
+    this.refActive = on && this.refBuffer !== null;
+    this.applyAb();
+  }
+
+  private applyAb(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.abMix || !this.refBus) return;
+    const now = ctx.currentTime;
+    this.abMix.gain.setTargetAtTime(this.refActive ? 0 : 1, now, 0.01);
+    this.refBus.gain.setTargetAtTime(this.refActive ? Math.pow(10, this.refGainDb / 20) : 0, now, 0.01);
+  }
+
+  /** Reference audio for one transport segment (timeline `from`..`to` = reference time). */
+  private scheduleReference(seg: { ctxStart: number; from: number; to: number }): void {
+    const ctx = this.ctx;
+    const ref = this.refBuffer;
+    if (!ctx || !ref || !this.refBus || seg.from >= ref.duration) return;
+    const end = Math.min(seg.to, ref.duration);
+    const dur = end - seg.from;
+    if (dur <= 0.005) return;
+    const source = ctx.createBufferSource();
+    source.buffer = ref;
+    const gain = ctx.createGain();
+    // micro-fades so loop jumps don't click
+    gain.gain.setValueAtTime(0, seg.ctxStart);
+    gain.gain.linearRampToValueAtTime(1, seg.ctxStart + 0.004);
+    gain.gain.setValueAtTime(1, seg.ctxStart + dur - 0.004);
+    gain.gain.linearRampToValueAtTime(0, seg.ctxStart + dur);
+    source.connect(gain);
+    gain.connect(this.refBus);
+    source.start(seg.ctxStart, seg.from, dur);
+    const node = { source, gain };
+    this.refNodes.add(node);
+    source.onended = () => {
+      this.refNodes.delete(node);
+      source.disconnect();
+      gain.disconnect();
+    };
+  }
+
+  /** Re-schedules playback from the current position (keeps loop), e.g. after loading a reference. */
+  private restartInPlace(): void {
+    const t = this.transport;
+    if (!t || !this.isPlaying) return;
+    this.play(t.tracks, t.clips, this.getTimelinePosition(), t.loop);
+  }
+
   /** Updates the shared reverb/delay returns (the delay follows `bpm`). */
   public setReturns(returns: FxReturns, bpm: number): void {
     this.returns = returns;
@@ -748,23 +873,33 @@ export class StudioAudioEngine {
     autoPitchFormant.Q.value = 1.8;
     autoPitchFormant.gain.value = 0;
 
-    // Stage 3: 3-Band Parametric EQ
-    const eqLow = ctx.createBiquadFilter();
-    eqLow.type = 'lowshelf';
-    eqLow.frequency.value = 110;
-
-    const eqMid = ctx.createBiquadFilter();
-    eqMid.type = 'peaking';
-
-    const eqHigh = ctx.createBiquadFilter();
-    eqHigh.type = 'highshelf';
-    eqHigh.frequency.value = 7500;
+    // Stage 3: 6-band parametric EQ. Bands start as 0 dB peaking filters (exact pass-throughs);
+    // applyEffectsToNodes gives them their real type and settings.
+    const eqBands = Array.from({ length: EQ_BAND_COUNT }, () => {
+      const f = ctx.createBiquadFilter();
+      f.type = 'peaking';
+      f.gain.value = 0;
+      return f;
+    });
+    const toneShelf = ctx.createBiquadFilter();
+    toneShelf.type = 'highshelf';
+    toneShelf.frequency.value = 7500;
+    toneShelf.gain.value = 0;
 
     // Stage 4: Tube Saturation & Dynamics Compressor
     const driveShaper = ctx.createWaveShaper();
     driveShaper.oversample = '2x';
 
     const compressor = ctx.createDynamicsCompressor();
+    // DynamicsCompressorNode has a fixed 6 ms lookahead (measured: 264 samples @ 44.1 kHz,
+    // 288 @ 48 kHz): the dry path gets the same delay, sample-exact, so mixing doesn't comb-filter
+    const compDryDelay = ctx.createDelay(0.05);
+    compDryDelay.delayTime.value = Math.round(ctx.sampleRate * 0.006) / ctx.sampleRate;
+    const compDry = ctx.createGain();
+    compDry.gain.value = 0;
+    const compWet = ctx.createGain();
+    const compSum = ctx.createGain();
+    const duckGain = ctx.createGain();
 
     // Stage 5: Dry & Wet Mix Routing
     const processedDryGain = ctx.createGain();
@@ -837,19 +972,24 @@ export class StudioAudioEngine {
     deEsserFilter.connect(harshCutFilter);
     harshCutFilter.connect(vocalWarmthFilter);
     vocalWarmthFilter.connect(autoPitchFormant);
-    autoPitchFormant.connect(eqLow);
-    eqLow.connect(eqMid);
-    eqMid.connect(eqHigh);
-    eqHigh.connect(driveShaper);
+    autoPitchFormant.connect(eqBands[0]);
+    for (let i = 0; i < eqBands.length - 1; i++) eqBands[i].connect(eqBands[i + 1]);
+    eqBands[eqBands.length - 1].connect(toneShelf);
+    toneShelf.connect(driveShaper);
     driveShaper.connect(compressor);
+    compressor.connect(compWet);
+    compWet.connect(compSum);
+    driveShaper.connect(compDryDelay);
+    compDryDelay.connect(compDry);
+    compDry.connect(compSum);
 
     // Processed core path
-    compressor.connect(processedDryGain);
+    compSum.connect(processedDryGain);
     processedDryGain.connect(sumNode);
 
     // Vocal Harmony / Choir path
-    compressor.connect(harmonyDelayL);
-    compressor.connect(harmonyDelayR);
+    compSum.connect(harmonyDelayL);
+    compSum.connect(harmonyDelayR);
     harmonyDelayL.connect(harmonyPanL);
     harmonyDelayR.connect(harmonyPanR);
     harmonyPanL.connect(harmonyWetGain);
@@ -857,14 +997,14 @@ export class StudioAudioEngine {
     harmonyWetGain.connect(wetMasterGain);
 
     // Stereo Delay loop -> Wet Master
-    compressor.connect(delayNode);
+    compSum.connect(delayNode);
     delayNode.connect(delayFeedback);
     delayFeedback.connect(delayNode);
     delayNode.connect(delayWet);
     delayWet.connect(wetMasterGain);
 
     // Reverb send -> Wet Master
-    compressor.connect(convolver);
+    compSum.connect(convolver);
     convolver.connect(reverbWet);
     reverbWet.connect(wetMasterGain);
 
@@ -873,7 +1013,8 @@ export class StudioAudioEngine {
     // Output strip
     sumNode.connect(volumeNode);
     volumeNode.connect(autoGain);
-    autoGain.connect(pannerNode);
+    autoGain.connect(duckGain);
+    duckGain.connect(pannerNode);
     if (buses) {
       // Post-fader, post-pan sends (muting the track also mutes its sends)
       if (!isOffline || (track.sends?.reverb ?? 0) > 0) {
@@ -902,11 +1043,15 @@ export class StudioAudioEngine {
       harshCutFilter,
       vocalWarmthFilter,
       autoPitchFormant,
-      eqLow,
-      eqMid,
-      eqHigh,
+      eqBands,
+      toneShelf,
       driveShaper,
       compressor,
+      compWet,
+      compDry,
+      compDryDelay,
+      compSum,
+      duckGain,
       processedDryGain,
       wetMasterGain,
       harmonyDelayL,
@@ -959,11 +1104,12 @@ export class StudioAudioEngine {
       Math.max(0, wetNorm - 1) * 0.25;
     const rawDry = dryNorm * (1 - Math.min(1, wetNorm));
 
-    if (fx.reverbMix <= 0 || wetNorm <= 0) cut(nodes.compressor, nodes.convolver);
-    if (fx.delayMix <= 0 || wetNorm <= 0) cut(nodes.compressor, nodes.delayNode);
+    if (fx.reverbMix <= 0 || wetNorm <= 0) cut(nodes.compSum, nodes.convolver);
+    if (fx.delayMix <= 0 || wetNorm <= 0) cut(nodes.compSum, nodes.delayNode);
+    if (this.compDryLevel(fx) <= 0) cut(nodes.driveShaper, nodes.compDryDelay);
     if (harmonyWet <= 0 || wetNorm <= 0) {
-      cut(nodes.compressor, nodes.harmonyDelayL);
-      cut(nodes.compressor, nodes.harmonyDelayR);
+      cut(nodes.compSum, nodes.harmonyDelayL);
+      cut(nodes.compSum, nodes.harmonyDelayR);
       try {
         nodes.harmonyLfoL.stop();
         nodes.harmonyLfoR.stop();
@@ -979,7 +1125,8 @@ export class StudioAudioEngine {
     const pitchRatio = clamp01((fx.autoPitchAmount ?? 0) / 100);
     const nr = clamp01((fx.noiseRemoval ?? 0) / 100);
     const hasDynDeEss = !!(nodes.deEsserDyn as AudioWorkletNode).parameters?.get('amount');
-    const highGain = fx.eqHighGain - (hasDynDeEss ? 0 : softRatio * 3) + pitchRatio * 2;
+    const toneGain = -(hasDynDeEss ? 0 : softRatio * 3) + pitchRatio * 2;
+    const bands = resolveEq(fx);
     const stages: [AudioNode, boolean][] = [
       [nodes.input, true],
       [nodes.rumbleHighpass, nr > 0],
@@ -989,9 +1136,8 @@ export class StudioAudioEngine {
       [nodes.harshCutFilter, softRatio > 0],
       [nodes.vocalWarmthFilter, softRatio > 0],
       [nodes.autoPitchFormant, pitchRatio > 0],
-      [nodes.eqLow, Math.abs(fx.eqLowGain) > 0.01],
-      [nodes.eqMid, Math.abs(fx.eqMidGain) > 0.01],
-      [nodes.eqHigh, Math.abs(highGain) > 0.01],
+      ...nodes.eqBands.map((n, i): [AudioNode, boolean] => [n, bandActive(bands[i])]),
+      [nodes.toneShelf, Math.abs(toneGain) > 0.01],
       [nodes.driveShaper, true],
       [nodes.compressor, true],
     ];
@@ -1036,13 +1182,17 @@ export class StudioAudioEngine {
     const pitchRatio = Math.max(0, Math.min(1, (fx.autoPitchAmount ?? 0) / 100));
     nodes.autoPitchFormant.gain.setTargetAtTime(pitchRatio * 5.5, now, 0.015);
 
-    // 3-Band EQ
-    nodes.eqLow.gain.setTargetAtTime(fx.eqLowGain, now, 0.015);
-    nodes.eqMid.frequency.setTargetAtTime(fx.eqMidFreq, now, 0.015);
-    nodes.eqMid.Q.setTargetAtTime(fx.eqMidQ, now, 0.015);
-    nodes.eqMid.gain.setTargetAtTime(fx.eqMidGain, now, 0.015);
+    // Parametric EQ. A band that is off becomes a 0 dB peaking filter: an exact pass-through.
+    resolveEq(fx).forEach((band, i) => {
+      const node = nodes.eqBands[i];
+      const type: BiquadFilterType = band.on ? band.type : 'peaking';
+      if (node.type !== type) node.type = type;
+      node.frequency.setTargetAtTime(band.freq, now, 0.015);
+      node.Q.setTargetAtTime(band.on ? nodeQ(band) : 1, now, 0.015);
+      node.gain.setTargetAtTime(band.on ? band.gain : 0, now, 0.015);
+    });
     const softHighCut = deEssAmount ? 0 : softRatio * 3.0;
-    nodes.eqHigh.gain.setTargetAtTime(fx.eqHighGain - softHighCut + pitchRatio * 2.0, now, 0.015);
+    nodes.toneShelf.gain.setTargetAtTime(-softHighCut + pitchRatio * 2.0, now, 0.015);
 
     nodes.driveShaper.curve = this.createDistortionCurve(fx.drive);
 
@@ -1057,6 +1207,10 @@ export class StudioAudioEngine {
       nodes.compressor.threshold.setTargetAtTime(0, now, 0.015);
       nodes.compressor.ratio.setTargetAtTime(1, now, 0.015);
     }
+    // Parallel compression (Mix): blend the compressed signal with the delay-matched dry one
+    const dry = this.compDryLevel(fx);
+    nodes.compDry.gain.setTargetAtTime(dry, now, 0.015);
+    nodes.compWet.gain.setTargetAtTime(1 - dry, now, 0.015);
 
     // Dry & Wet Levels
     const dryNorm = Math.max(0, Math.min(1.5, (fx.dryLevel ?? 100) / 100));
@@ -1115,6 +1269,76 @@ export class StudioAudioEngine {
     nodes.reverbWet.gain.setTargetAtTime(fx.reverbMix * 1.4, now, 0.02);
   }
 
+  /** Dry share for parallel compression (0 when the compressor is off: no point mixing). */
+  private compDryLevel(fx: TrackEffects): number {
+    if (!fx.compEnabled) return 0;
+    return 1 - Math.max(0, Math.min(100, fx.compMix ?? 100)) / 100;
+  }
+
+  /**
+   * Connects ducking: each ducked track's duckGain.gain is driven by an envelope worklet that
+   * listens to its key track (post-fader). Shared per key track. Works for live and offline graphs.
+   */
+  private wireDucking(
+    ctx: BaseAudioContext,
+    tracks: AudioTrack[],
+    nodesById: Map<string, TrackGraphNodes>,
+    envs: Map<string, AudioWorkletNode>,
+    wired: Map<string, string>
+  ): void {
+    if (!this.dspReady.has(ctx)) return;
+    const wanted = new Map<string, { key: string; amount: number }>();
+    for (const t of tracks) {
+      const d = t.duck;
+      if (d && d.amountDb > 0 && d.keyTrackId !== t.id && nodesById.has(d.keyTrackId)) {
+        wanted.set(t.id, { key: d.keyTrackId, amount: d.amountDb });
+      }
+    }
+    // Undo connections that are no longer wanted (or moved to another key)
+    for (const [trackId, keyId] of wired) {
+      const w = wanted.get(trackId);
+      if (w && w.key === keyId) continue;
+      const env = envs.get(keyId);
+      const nodes = nodesById.get(trackId);
+      if (env && nodes) {
+        try {
+          env.disconnect(nodes.duckGain.gain);
+        } catch {}
+        nodes.duckGain.gain.value = 1;
+      }
+      wired.delete(trackId);
+    }
+    for (const [trackId, w] of wanted) {
+      let env = envs.get(w.key);
+      if (!env) {
+        env = new AudioWorkletNode(ctx, 'aether-duck-env', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+        nodesById.get(w.key)!.pannerNode.connect(env);
+        envs.set(w.key, env);
+      }
+      env.parameters.get('amountDb')!.value = Math.max(0, Math.min(18, w.amount));
+      if (wired.get(trackId) !== w.key) {
+        const nodes = nodesById.get(trackId)!;
+        nodes.duckGain.gain.value = 0; // the envelope output (1 = no ducking) becomes the gain
+        env.connect(nodes.duckGain.gain);
+        wired.set(trackId, w.key);
+      }
+    }
+    // Drop envelopes no track listens to any more
+    const used = new Set(Array.from(wanted.values(), (w) => w.key));
+    for (const [keyId, env] of envs) {
+      if (used.has(keyId)) continue;
+      try {
+        env.disconnect();
+        nodesById.get(keyId)?.pannerNode.disconnect(env);
+      } catch {}
+      envs.delete(keyId);
+    }
+  }
+
   public syncTracks(tracks: AudioTrack[]): void {
     this.lastSyncedTracks = tracks;
     const ctx = this.getContext();
@@ -1156,6 +1380,9 @@ export class StudioAudioEngine {
       }
       this.applyEffectsToNodes(ctx, nodes, track.effects);
     }
+    // Removed tracks: forget their ducking
+    for (const id of [...this.duckWired.keys()]) if (!activeTrackIds.has(id)) this.duckWired.delete(id);
+    this.wireDucking(ctx, tracks, this.trackNodes, this.duckEnvs, this.duckWired);
   }
 
   /* --------------------------------- transport -------------------------------- */
@@ -1311,6 +1538,7 @@ export class StudioAudioEngine {
       const seg = this.segmentAt(t.nextSegment);
       if (!seg || seg.ctxStart >= horizon) break;
       this.scheduleSegment(seg);
+      this.scheduleReference(seg);
       t.nextSegment++;
     }
 
@@ -1397,6 +1625,19 @@ export class StudioAudioEngine {
     }
     this.activeSources.clear();
     this.activeClipNodes.clear();
+    for (const n of this.refNodes) {
+      try {
+        if (fadeSec > 0) {
+          n.gain.gain.cancelScheduledValues(now);
+          n.gain.gain.setValueAtTime(n.gain.gain.value, now);
+          n.gain.gain.linearRampToValueAtTime(0, now + fadeSec);
+          n.source.stop(now + fadeSec + 0.005);
+        } else {
+          n.source.stop();
+        }
+      } catch {}
+    }
+    this.refNodes.clear();
     this.stopScheduledClicks();
     if (this.transport) {
       this.transport.fromTime = this.getTimelinePosition();
@@ -1503,6 +1744,42 @@ export class StudioAudioEngine {
     }
   }
 
+  /**
+   * Live spectrum (dB per FFT bin, 4096-point) of a track after its effects, for the EQ display.
+   * Returns null while stopped. Call releaseSpectrum() when the display closes.
+   */
+  public getTrackSpectrum(trackId: string): { data: Float32Array; sampleRate: number } | null {
+    const ctx = this.ctx;
+    const nodes = this.trackNodes.get(trackId);
+    if (!ctx || !nodes || !this.isPlaying) return null;
+    let sp = this.spectrum;
+    if (!sp || sp.trackId !== trackId || sp.source !== nodes.pannerNode) {
+      this.releaseSpectrum();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.8;
+      analyser.minDecibels = -100;
+      analyser.maxDecibels = -10;
+      nodes.pannerNode.connect(analyser);
+      sp = this.spectrum = {
+        analyser,
+        source: nodes.pannerNode,
+        trackId,
+        data: new Float32Array(analyser.frequencyBinCount),
+      };
+    }
+    sp.analyser.getFloatFrequencyData(sp.data);
+    return { data: sp.data, sampleRate: ctx.sampleRate };
+  }
+
+  public releaseSpectrum(): void {
+    if (!this.spectrum) return;
+    try {
+      this.spectrum.source.disconnect(this.spectrum.analyser);
+    } catch {}
+    this.spectrum = null;
+  }
+
   public getMeterLevels(): MeterLevels {
     if (!this.leftAnalyser || !this.rightAnalyser) {
       return {
@@ -1512,6 +1789,7 @@ export class StudioAudioEngine {
         masterRmsDb: -60,
         phaseCorrelation: 1,
         trackLevels: {},
+        trackReduction: {},
       };
     }
 
@@ -1549,6 +1827,7 @@ export class StudioAudioEngine {
     const phaseCorrelation = denom > 0.00001 ? Math.max(-1, Math.min(1, dotLR / denom)) : 1;
 
     const trackLevels: Record<string, number> = {};
+    const trackReduction: Record<string, number> = {};
     const tempBuf = new Float32Array(256);
     for (const [trackId, nodes] of this.trackNodes.entries()) {
       nodes.analyser.getFloatTimeDomainData(tempBuf);
@@ -1558,6 +1837,7 @@ export class StudioAudioEngine {
         if (a > pk) pk = a;
       }
       trackLevels[trackId] = Math.min(1, pk);
+      trackReduction[trackId] = nodes.compressor.reduction;
     }
 
     return {
@@ -1567,6 +1847,7 @@ export class StudioAudioEngine {
       masterRmsDb,
       phaseCorrelation,
       trackLevels,
+      trackReduction,
     };
   }
 
@@ -1951,9 +2232,10 @@ export class StudioAudioEngine {
     masterVolume: number,
     master: MasterSettings,
     returns: FxReturns = this.returns,
-    bpm: number = this.currentBpm
+    bpm: number = this.currentBpm,
+    options: RenderOptions = {}
   ): Promise<{ buffer: AudioBuffer; report: LoudnessReport }> {
-    const raw = await this.renderMixdown(tracks, clips, masterVolume, master, returns, bpm);
+    const raw = await this.renderMixdown(tracks, clips, masterVolume, master, returns, bpm, options);
     try {
       return await this.masterInWorker(raw, master);
     } catch {
@@ -2008,11 +2290,23 @@ export class StudioAudioEngine {
     masterVolume: number,
     master?: MasterSettings,
     returns: FxReturns = this.returns,
-    bpm: number = this.currentBpm
+    bpm: number = this.currentBpm,
+    options: RenderOptions = {}
   ): Promise<AudioBuffer> {
+    // Every stem has the same length as the full mix, so they line up when imported elsewhere
     const maxEnd =
       clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 4.0) + 1.5;
-    const sampleRate = 44100;
+    const sampleRate = options.sampleRate ?? 44100;
+    // Stem: build only that track plus the track it ducks under (which stays silent: it only
+    // drives the ducking envelope), so the stem sounds exactly like it does in the mix
+    const stemTrack = options.onlyTrackId ? tracks.find((t) => t.id === options.onlyTrackId) : undefined;
+    const keyOnly = new Set<string>();
+    if (options.onlyTrackId) {
+      if (!stemTrack) throw new Error('Unknown stem track');
+      const key = stemTrack.duck && stemTrack.duck.amountDb > 0 ? stemTrack.duck.keyTrackId : null;
+      if (key && key !== stemTrack.id && tracks.some((t) => t.id === key)) keyOnly.add(key);
+      tracks = tracks.filter((t) => t.id === stemTrack.id || keyOnly.has(t.id));
+    }
     const offlineCtx = new OfflineAudioContext(2, Math.ceil(maxEnd * sampleRate), sampleRate);
 
     const masterOut = offlineCtx.createGain();
@@ -2027,14 +2321,17 @@ export class StudioAudioEngine {
       masterOut.connect(offlineCtx.destination);
     }
 
-    const anySolo = tracks.some((t) => t.solo);
+    const anySolo = !stemTrack && tracks.some((t) => t.solo);
     const offlineTrackNodes = new Map<string, TrackGraphNodes>();
-    if (tracks.some((t) => (t.effects.voiceSoftener ?? 0) > 0)) {
+    const usesDucking = tracks.some((t) => t.duck && t.duck.amountDb > 0);
+    if (usesDucking || tracks.some((t) => (t.effects.voiceSoftener ?? 0) > 0)) {
       await this.ensureDspModule(offlineCtx);
     }
 
     // FX returns only when some track actually sends to them
-    const usesReturns = tracks.some((t) => (t.sends?.reverb ?? 0) > 0 || (t.sends?.delay ?? 0) > 0);
+    const usesReturns = tracks.some(
+      (t) => !keyOnly.has(t.id) && ((t.sends?.reverb ?? 0) > 0 || (t.sends?.delay ?? 0) > 0)
+    );
     let buses: ReturnBuses | null = null;
     if (usesReturns) {
       buses = createReturnBuses(offlineCtx, returns, bpm);
@@ -2043,12 +2340,15 @@ export class StudioAudioEngine {
 
     for (const track of tracks) {
       const nodes = this.buildTrackChain(offlineCtx, masterOut, track, true, buses);
-      const isAudible = anySolo ? track.solo : !track.muted;
+      const isAudible = stemTrack ? true : anySolo ? track.solo : !track.muted;
       nodes.volumeNode.gain.value = isAudible ? track.volume : 0;
       nodes.pannerNode.pan.value = track.pan;
       scheduleAutomation(nodes.autoGain.gain, track.automation?.volume, 0, Infinity, 0);
+      // Ducking key of a stem: processed as usual but not heard (output and sends cut)
+      if (keyOnly.has(track.id)) nodes.pannerNode.disconnect();
       offlineTrackNodes.set(track.id, nodes);
     }
+    if (usesDucking) this.wireDucking(offlineCtx, tracks, offlineTrackNodes, new Map(), new Map());
 
     for (const clip of clips) {
       const buffer = this.buffers.get(clip.bufferId);

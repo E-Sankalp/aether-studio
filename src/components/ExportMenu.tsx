@@ -1,10 +1,36 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronDown, Download } from 'lucide-react';
-import { EXPORT_FORMATS, ExportFormatId } from '../audio/audioEncoders';
+import {
+  EXPORT_FORMATS,
+  EXPORT_SAMPLE_RATES,
+  ExportFormatId,
+  ExportSampleRate,
+} from '../audio/audioEncoders';
+
+export interface ExportOptions {
+  sampleRate: ExportSampleRate;
+  /** One file per track (in a ZIP) instead of the mastered mix */
+  stems: boolean;
+}
+
+const STORAGE_KEY = 'aether.exportOptions';
+const loadOptions = (): ExportOptions => {
+  try {
+    const o = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') as Partial<ExportOptions>;
+    return {
+      sampleRate: EXPORT_SAMPLE_RATES.includes(o.sampleRate as ExportSampleRate)
+        ? (o.sampleRate as ExportSampleRate)
+        : 44100,
+      stems: o.stems === true,
+    };
+  } catch {
+    return { sampleRate: 44100, stems: false };
+  }
+};
 
 interface ExportMenuProps {
   isExporting: boolean;
-  onExport: (format: ExportFormatId) => void;
+  onExport: (format: ExportFormatId, options: ExportOptions) => void;
   /** Mobile layout: full-width button with the format list expanding in the page flow. */
   inline?: boolean;
 }
@@ -12,6 +38,14 @@ interface ExportMenuProps {
 /** Export button that lets the user choose the output audio format. */
 export const ExportMenu: React.FC<ExportMenuProps> = ({ isExporting, onExport, inline = false }) => {
   const [open, setOpen] = useState(false);
+  const [options, setOptions] = useState<ExportOptions>(loadOptions);
+  const setOpt = (patch: Partial<ExportOptions>) => {
+    const next = { ...options, ...patch };
+    setOptions(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {}
+  };
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -32,7 +66,7 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({ isExporting, onExport, i
 
   const choose = (id: ExportFormatId) => {
     setOpen(false);
-    onExport(id);
+    onExport(id, options);
   };
 
   const list = (
@@ -44,8 +78,54 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({ isExporting, onExport, i
           : 'absolute right-0 top-full mt-2 w-64 rounded-2xl bg-panel/95 backdrop-blur border border-line shadow-2xl shadow-black/60 overflow-hidden z-[60]'
       }
     >
-      <div className="px-3.5 pt-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-mute">
-        Export format
+      <div className="px-3.5 pt-3 pb-2.5 flex flex-col gap-2 border-b border-line">
+        <div role="radiogroup" aria-label="What to export" className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-app">
+          {[
+            { stems: false, label: 'Full mix' },
+            { stems: true, label: 'Stems (ZIP)' },
+          ].map((o) => (
+            <button
+              key={o.label}
+              type="button"
+              role="radio"
+              aria-checked={options.stems === o.stems}
+              onClick={() => setOpt({ stems: o.stems })}
+              className={`h-7 rounded-md text-[12px] font-semibold ${
+                options.stems === o.stems ? 'bg-raised text-white' : 'text-mute hover:text-white'
+              }`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] text-mute">Sample rate</span>
+          <div role="radiogroup" aria-label="Sample rate" className="flex gap-1">
+            {EXPORT_SAMPLE_RATES.map((sr) => (
+              <button
+                key={sr}
+                type="button"
+                role="radio"
+                aria-checked={options.sampleRate === sr}
+                onClick={() => setOpt({ sampleRate: sr })}
+                className={`h-6 px-2 rounded-md text-[11px] font-mono ${
+                  options.sampleRate === sr ? 'bg-raised text-white' : 'bg-app text-mute hover:text-white'
+                }`}
+              >
+                {sr === 44100 ? '44.1' : sr / 1000}k
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className="text-[11px] text-mute leading-snug">
+          {options.stems
+            ? 'One file per track with its effects and sends, before mastering. They line up and add up to your mix.'
+            : 'Mastered to your loudness target.'}{' '}
+          {options.sampleRate > 48000 ? 'MP3 is saved at 48 kHz. ' : ''}16-bit and MP3 are dithered.
+        </p>
+      </div>
+      <div className="px-3.5 pt-2.5 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-mute">
+        Format
       </div>
       {EXPORT_FORMATS.map((f) => (
         <button
